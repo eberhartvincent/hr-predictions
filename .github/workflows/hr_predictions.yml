@@ -1,0 +1,156 @@
+# .github/workflows/hr_predictions.yml
+# =====================================================================
+#  MLB Home Run Predictor — GitHub Actions Workflow
+# =====================================================================
+#
+#  Schedule: Runs daily at 11:30 AM ET (15:30 UTC) — after lineups
+#            are typically announced for day games and early updates
+#            are in for night games.
+#
+#  Manual trigger: Go to Actions → HR Predictions → Run workflow
+#    Options:
+#      • date       — prediction date (YYYY-MM-DD or "today")
+#      • top_n      — number of players to include
+#      • dry_run    — "true" to predict without sending email
+#
+#  Required Secrets (Settings → Secrets → Actions):
+#    EMAIL_SENDER        — Gmail address used to send
+#    EMAIL_PASSWORD      — Gmail App Password (not your main password)
+#    EMAIL_RECIPIENTS    — comma-separated list of recipient addresses
+#    OPENWEATHER_API_KEY — from openweathermap.org (free tier is fine)
+#
+# =====================================================================
+
+name: ⚾ HR Predictions
+
+on:
+  # Daily automated run
+  schedule:
+    - cron: "30 15 * * *"   # 11:30 AM ET daily (UTC-4 EDT)
+
+  # Manual trigger with optional overrides
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Prediction date (YYYY-MM-DD or 'today')"
+        required: false
+        default: "today"
+        type: string
+      top_n:
+        description: "Number of predictions to include"
+        required: false
+        default: "10"
+        type: string
+      dry_run:
+        description: "Dry run — predict but don't send email"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+  # Allow calling from other workflows (e.g. a test workflow)
+  workflow_call:
+    inputs:
+      date:
+        type: string
+        default: "today"
+      top_n:
+        type: string
+        default: "10"
+      dry_run:
+        type: string
+        default: "false"
+    secrets:
+      EMAIL_SENDER:
+        required: true
+      EMAIL_PASSWORD:
+        required: true
+      EMAIL_RECIPIENTS:
+        required: true
+      OPENWEATHER_API_KEY:
+        required: true
+
+jobs:
+  predict-and-send:
+    name: Generate & Send HR Predictions
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python setup ───────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ── 3. Dependency install ─────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── 4. Cache pybaseball data (avoids re-downloading Statcast) ─
+      - name: Cache pybaseball data
+        uses: actions/cache@v4
+        with:
+          path: ~/.pybaseball
+          key: pybaseball-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            pybaseball-${{ runner.os }}-
+
+      # ── 5. Resolve inputs ─────────────────────────────────────────
+      - name: Resolve workflow inputs
+        id: resolve
+        run: |
+          # Handle both scheduled runs (no inputs) and manual triggers
+          DATE="${{ github.event.inputs.date || inputs.date || 'today' }}"
+          TOP_N="${{ github.event.inputs.top_n || inputs.top_n || '10' }}"
+          DRY_RUN="${{ github.event.inputs.dry_run || inputs.dry_run || 'false' }}"
+          echo "date=${DATE}" >> $GITHUB_OUTPUT
+          echo "top_n=${TOP_N}" >> $GITHUB_OUTPUT
+          echo "dry_run=${DRY_RUN}" >> $GITHUB_OUTPUT
+          echo "📅 Date: ${DATE} | Top N: ${TOP_N} | Dry run: ${DRY_RUN}"
+
+      # ── 6. Run the prediction pipeline ───────────────────────────
+      - name: Run HR prediction pipeline
+        env:
+          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
+          EMAIL_SENDER:        ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD:      ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECIPIENTS:    ${{ secrets.EMAIL_RECIPIENTS }}
+          PREDICT_DATE:        ${{ steps.resolve.outputs.date }}
+          TOP_N:               ${{ steps.resolve.outputs.top_n }}
+        run: |
+          DRY_FLAG=""
+          if [ "${{ steps.resolve.outputs.dry_run }}" = "true" ]; then
+            DRY_FLAG="--dry-run"
+          fi
+
+          python main.py \
+            --date "${{ steps.resolve.outputs.date }}" \
+            --top-n "${{ steps.resolve.outputs.top_n }}" \
+            $DRY_FLAG
+
+      # ── 7. Upload run log as artifact (for debugging) ─────────────
+      - name: Upload prediction log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prediction-log-${{ github.run_id }}
+          path: "*.log"
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # ── 8. Notify on failure ──────────────────────────────────────
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::error::HR prediction pipeline failed. Check the logs above."
+          echo "Tip: Re-run with dry_run=true to test without sending email."

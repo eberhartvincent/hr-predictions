@@ -1,0 +1,78 @@
+# ============================================================
+#  MLB Home Run Predictor — Configuration
+# ============================================================
+# All values here are defaults. Override via env vars or
+# GitHub Actions workflow inputs.
+
+prediction:
+  top_n: 10                  # How many players to show in the email
+  date: "today"              # "today" or "YYYY-MM-DD"
+  min_pa_season: 30          # Min plate appearances (season) to qualify
+  min_pa_career: 100         # Min plate appearances (career) to qualify
+  min_games_played: 10       # Min games played this season to qualify
+
+model:
+  # Relative weights used in the ensemble scoring
+  # Must sum to 1.0
+  weights:
+    barrel_rate:      0.25   # Statcast barrel % (best HR predictor)
+    exit_velocity:    0.15   # Average exit velocity on contact
+    hr_rate:          0.20   # Batter's HR/PA rate (blended season+career)
+    pitcher_factor:   0.18   # Pitcher's HR allowed profile
+    park_factor:      0.10   # Ballpark HR factor
+    weather_factor:   0.07   # Temp, wind speed/direction
+    platoon_factor:   0.03   # Handedness matchup advantage
+    recent_form:      0.02   # Performance over last N games
+
+  recent_form_games: 15      # Window for recent form calculation
+  career_season_blend: 0.35  # Weight on career stats (1-x = season weight)
+  min_ip_pitcher: 10         # Min innings pitched for pitcher to qualify
+
+email:
+  subject: "⚾ Top {n} HR Predictions — {date}"
+  from_name: "MLB HR Predictor"
+  # Recipients come from EMAIL_RECIPIENTS secret (comma-separated)
+
+weather:
+  # Stadiums with retractable/permanent roofs — weather ignored
+  covered_stadiums:
+    - "Minute Maid Park"
+    - "Globe Life Field"
+    - "American Family Field"
+    - "Chase Field"
+    - "Tropicana Field"
+    - "Rogers Centre"
+    - "T-Mobile Park"
+    - "loanDepot park"
+    - "Toyota Dome"
+
+  # Temperature effect: ball travels ~1% farther per 10°F above 70°F
+  temp_baseline_f: 70
+  temp_effect_per_10f: 0.012   # 1.2% HR rate boost per 10°F above baseline
+
+  # Wind thresholds
+  wind_out_boost: 0.10         # 10% boost when wind blows out ≥ 10 mph
+  wind_in_penalty: -0.10       # 10% penalty when wind blows in ≥ 10 mph
+  wind_threshold_mph: 10
+
+parks:
+  # HR park factors — 1.00 = neutral, >1 = HR friendly
+  # Derived from 3-year rolling park factors (update annually)
+  factors:
+    "Coors Field":                1.38
+    "Great American Ball Park":   1.18
+    "Citizens Bank Park":         1.14
+    "Yankee Stadium":             1.13
+    "Fenway Park":                1.11
+    "Globe Life Field":           1.09
+    "Camden Yards":               1.07
+    "Guaranteed Rate Field":      1.06
+    "Comerica Park":              1.02
+    "Wrigley Field":              1.01
+    "Dodger Stadium":             0.97
+    "Kauffman Stadium":           0.96
+    "Tropicana Field":            0.93
+    "T-Mobile Park":              0.92
+    "Petco Park":                 0.91
+    "Oracle Park":                0.88
+    "default":                    1.00
