@@ -16,10 +16,9 @@ from __future__ import annotations
 import difflib
 import logging
 import os
-from functools import lru_cache
+import time
 
 import requests
-from tenacity import retry, stop_after_attempt, wait_exponential
 
 log = logging.getLogger(__name__)
 
@@ -70,10 +69,7 @@ STADIUM_META: dict[str, dict] = {
     "Petco Park":                     {"lat": 32.7076, "lon": -117.1570,"cf_bearing": 315},
 }
 
-# ---------------------------------------------------------------------------
-# Aliases: partial / historical / alternate names → canonical key above.
-# Add entries here whenever the API surprises you with a new name variant.
-# ---------------------------------------------------------------------------
+# Alternate / historical / shorthand names → canonical key above.
 ALIASES: dict[str, str] = {
     "Camden Yards":                    "Oriole Park at Camden Yards",
     "Angel Stadium":                   "Angel Stadium of Anaheim",
@@ -82,26 +78,24 @@ ALIASES: dict[str, str] = {
     "Marlins Park":                    "loanDepot park",
     "Oakland-Alameda County Coliseum": "Oakland Coliseum",
     "RingCentral Coliseum":            "Oakland Coliseum",
-    "Guaranteed Rate Field ":          "Guaranteed Rate Field",   # trailing-space guard
 }
 
 _KNOWN_NAMES = list(STADIUM_META.keys())
 
+# Simple in-process cache — avoids duplicate OWM calls within one run.
+# Keyed by (lat, lon) tuple.
+_weather_cache: dict[tuple, dict] = {}
+
 
 def _resolve_venue(venue: str) -> dict:
-    """
-    Return STADIUM_META entry, trying exact → alias → fuzzy → default.
-    """
+    """Exact → alias → fuzzy → default (with warnings)."""
     venue = venue.strip()
-
     if venue in STADIUM_META:
         return STADIUM_META[venue]
-
     canonical = ALIASES.get(venue)
     if canonical and canonical in STADIUM_META:
         log.debug("Venue alias resolved: %r -> %r", venue, canonical)
         return STADIUM_META[canonical]
-
     matches = difflib.get_close_matches(venue, _KNOWN_NAMES, n=1, cutoff=0.75)
     if matches:
         log.warning(
@@ -109,7 +103,6 @@ def _resolve_venue(venue: str) -> dict:
             venue, matches[0],
         )
         return STADIUM_META[matches[0]]
-
     log.warning(
         "Unknown venue %r — weather disabled for this game. "
         "Add it to STADIUM_META in weather_client.py.",
@@ -118,9 +111,6 @@ def _resolve_venue(venue: str) -> dict:
     return {"lat": 0.0, "lon": 0.0, "cf_bearing": 0}
 
 
-# ---------------------------------------------------------------------------
-# Wind classification
-# ---------------------------------------------------------------------------
 def _wind_category(wind_deg: float, wind_speed: float, cf_bearing: int) -> str:
     if wind_speed < 3:
         return "calm"
@@ -141,27 +131,59 @@ def _wind_category(wind_deg: float, wind_speed: float, cf_bearing: int) -> str:
     return "crosswind"
 
 
-# ---------------------------------------------------------------------------
-# Weather fetch
-# ---------------------------------------------------------------------------
-@lru_cache(maxsize=64)
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=8))
 def _fetch_owm(lat: float, lon: float) -> dict:
+    """
+    Call OWM current-weather endpoint with up to 3 retries.
+    Raises requests.HTTPError on bad status (caller logs the code).
+    """
+    cache_key = (round(lat, 4), round(lon, 4))
+    if cache_key in _weather_cache:
+        return _weather_cache[cache_key]
+
     api_key = os.environ.get("OPENWEATHER_API_KEY", "")
     if not api_key:
-        raise ValueError("OPENWEATHER_API_KEY not set")
-    resp = requests.get(
-        f"{OWM_BASE}/weather",
-        params={"lat": lat, "lon": lon, "appid": api_key, "units": "imperial"},
-        timeout=10,
-    )
-    resp.raise_for_status()
-    return resp.json()
+        raise ValueError("OPENWEATHER_API_KEY environment variable is not set.")
+
+    last_exc: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            resp = requests.get(
+                f"{OWM_BASE}/weather",
+                params={"lat": lat, "lon": lon, "appid": api_key, "units": "imperial"},
+                timeout=10,
+            )
+            # Raise immediately so we can inspect the status code
+            resp.raise_for_status()
+            data = resp.json()
+            _weather_cache[cache_key] = data
+            return data
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else "?"
+            if status == 401:
+                # Invalid key — no point retrying
+                raise requests.HTTPError(
+                    f"OWM returned 401 Unauthorized. "
+                    f"Check that OPENWEATHER_API_KEY is correct and has been activated "
+                    f"(new keys can take up to 2 hours to activate at openweathermap.org).",
+                    response=exc.response,
+                ) from exc
+            if status == 429:
+                log.warning("OWM rate-limited (429) on attempt %d — waiting 5s.", attempt)
+                time.sleep(5)
+            else:
+                log.warning("OWM HTTP %s on attempt %d.", status, attempt)
+            last_exc = exc
+        except Exception as exc:
+            log.warning("OWM request error on attempt %d: %s", attempt, exc)
+            last_exc = exc
+            time.sleep(2 * attempt)
+
+    raise last_exc  # type: ignore[misc]
 
 
 def get_game_weather(venue: str) -> dict:
     """
-    Return weather conditions for a venue.
+    Return weather conditions for a venue relevant to HR probability.
 
     Returns dict with:
         temperature_f, humidity_pct, wind_speed_mph, wind_direction_deg,
@@ -185,10 +207,9 @@ def get_game_weather(venue: str) -> dict:
 
     lat, lon = meta.get("lat", 0.0), meta.get("lon", 0.0)
     if lat == 0.0 and lon == 0.0:
-        return default   # already warned in _resolve_venue
+        return default
 
-    api_key = os.environ.get("OPENWEATHER_API_KEY", "")
-    if not api_key:
+    if not os.environ.get("OPENWEATHER_API_KEY"):
         log.warning(
             "OPENWEATHER_API_KEY not set — weather features disabled. "
             "Add it to GitHub Actions secrets (Settings → Secrets → Actions)."
@@ -197,6 +218,10 @@ def get_game_weather(venue: str) -> dict:
 
     try:
         raw = _fetch_owm(lat, lon)
+    except requests.HTTPError as exc:
+        # Log the full human-readable message we built above
+        log.warning("Weather fetch failed for %r: %s", venue, exc)
+        return default
     except Exception as exc:
         log.warning("Weather fetch failed for %r: %s", venue, exc)
         return default
