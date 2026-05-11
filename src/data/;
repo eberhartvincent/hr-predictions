@@ -49,6 +49,7 @@ STADIUM_META: dict[str, dict] = {
     "Oakland Coliseum":               {"lat": 37.7516, "lon": -122.2005,"cf_bearing": 360},
     "Sutter Health Park":             {"lat": 38.5787, "lon": -121.5001,"cf_bearing": 0},
     "T-Mobile Park":                  {"lat": 47.5914, "lon": -122.3325,"cf_bearing": 20,  "covered": True},
+    "Daikin Park":                    {"lat": 29.7573, "lon": -95.3553, "cf_bearing": 337, "covered": True},
     # NL East
     "Nationals Park":                 {"lat": 38.8730, "lon": -77.0074, "cf_bearing": 355},
     "loanDepot park":                 {"lat": 25.7781, "lon": -80.2197, "cf_bearing": 350, "covered": True},
