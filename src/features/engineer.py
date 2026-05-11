@@ -247,3 +247,34 @@ def exit_velocity_score(metrics: dict) -> float:
         ev = LG_AVG_EXIT_VELOCITY
     # Scale: 78 mph (low) → 0, 105 mph (elite) → 1
     return float(np.clip((ev - 78) / (105 - 78), 0, 1))
+
+
+# ---------------------------------------------------------------------------
+# Patch: replace park_factor with fuzzy-matching version
+# (The original definition above is superseded by this one at import time
+#  because Python uses the last definition of a name in a module.)
+# ---------------------------------------------------------------------------
+import difflib as _difflib   # noqa: E402 (late import OK — stdlib only)
+
+
+def park_factor(venue: str, config: dict) -> float:  # type: ignore[no-redef]
+    """
+    Return the park's HR factor from config.
+    Uses difflib fuzzy match so slight venue-name variants still resolve
+    (e.g. 'Oriole Park at Camden Yards' ≈ 'Camden Yards').
+    """
+    factors: dict = config.get("parks", {}).get("factors", {})
+    default = float(factors.get("default", 1.0))
+    venue = (venue or "").strip()
+
+    if venue in factors:
+        return float(factors[venue])
+
+    known = [k for k in factors if k != "default"]
+    matches = _difflib.get_close_matches(venue, known, n=1, cutoff=0.72)
+    if matches:
+        log.debug("Park factor fuzzy-matched %r → %r", venue, matches[0])
+        return float(factors[matches[0]])
+
+    log.debug("Park factor not found for %r, using default %.2f", venue, default)
+    return default
