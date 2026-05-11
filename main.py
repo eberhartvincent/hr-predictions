@@ -1,18 +1,6 @@
 #!/usr/bin/env python3
 """
-main.py
-=======
-Orchestrates the daily MLB home-run prediction pipeline.
-
-Usage
------
-  python main.py                         # today's date, top_n from config
-  python main.py --date 2024-08-10       # specific date
-  python main.py --top-n 5              # override top_n
-  python main.py --dry-run              # predict but don't send email
-  python main.py --test-email           # send email with today's predictions
-  python main.py --config my_config.yml # alternate config file
-  python main.py --retrain              # retrain model then predict
+main.py — MLB HR Prediction Pipeline
 """
 from __future__ import annotations
 
@@ -20,7 +8,7 @@ import argparse
 import logging
 import os
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import yaml
 
@@ -29,10 +17,7 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
     datefmt="%H:%M:%S",
 )
-# Suppress noisy matplotlib font manager logs from pybaseball dependency
-logging.getLogger("matplotlib").setLevel(logging.WARNING)
-logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
-
+logging.getLogger("matplotlib").setLevel(logging.ERROR)
 log = logging.getLogger("main")
 
 
@@ -51,32 +36,30 @@ def _import_pipeline():
     from src.models.model_registry import load as load_model
 
     return {
-        "get_schedule":               get_schedule,
-        "extract_matchups":           extract_matchups,
-        "get_roster":                 get_roster,
-        "get_player_info":            get_player_info,
-        "get_batter_stats":           get_batter_stats,
-        "get_pitcher_stats":          get_pitcher_stats,
-        "get_platoon_splits":         get_platoon_splits,
-        "get_recent_games":           get_recent_games,
-        "get_batter_statcast_metrics":get_batter_statcast_metrics,
+        "get_schedule":                get_schedule,
+        "extract_matchups":            extract_matchups,
+        "get_roster":                  get_roster,
+        "get_player_info":             get_player_info,
+        "get_batter_stats":            get_batter_stats,
+        "get_pitcher_stats":           get_pitcher_stats,
+        "get_platoon_splits":          get_platoon_splits,
+        "get_recent_games":            get_recent_games,
+        "get_batter_statcast_metrics": get_batter_statcast_metrics,
         "get_pitcher_statcast_metrics":get_pitcher_statcast_metrics,
-        "get_game_weather":           get_game_weather,
-        "ensemble_predict":           ensemble_predict,
-        "send_email":                 send_email,
-        "load_model":                 load_model,
+        "get_game_weather":            get_game_weather,
+        "ensemble_predict":            ensemble_predict,
+        "send_email":                  send_email,
+        "load_model":                  load_model,
     }
 
 
 def load_config(path: str = "config.yml") -> dict:
     with open(path) as f:
         cfg = yaml.safe_load(f)
-    top_n_env  = os.environ.get("TOP_N")
-    date_env   = os.environ.get("PREDICT_DATE")
-    if top_n_env:
-        cfg.setdefault("prediction", {})["top_n"] = int(top_n_env)
-    if date_env:
-        cfg.setdefault("prediction", {})["date"] = date_env
+    if os.environ.get("TOP_N"):
+        cfg.setdefault("prediction", {})["top_n"] = int(os.environ["TOP_N"])
+    if os.environ.get("PREDICT_DATE"):
+        cfg.setdefault("prediction", {})["date"] = os.environ["PREDICT_DATE"]
     return cfg
 
 
@@ -88,41 +71,58 @@ def _probable_lineup(fn, team_id: int, season: int, min_games: int) -> list[int]
         return []
     players = []
     for entry in roster:
-        pos = entry.get("position", {}).get("abbreviation", "")
-        if pos in ("SP", "RP", "P"):
+        if entry.get("position", {}).get("abbreviation", "") in ("SP", "RP", "P"):
             continue
         pid = entry.get("person", {}).get("id")
         if not pid:
             continue
         try:
             stats = fn["get_batter_stats"](pid, season)
-            gp = int(stats["season_stats"].get("gamesPlayed", 0))
-            if gp >= min_games:
+            if int(stats["season_stats"].get("gamesPlayed", 0)) >= min_games:
                 players.append(pid)
         except Exception:
             pass
     return players
 
 
+def resolve_game_date(raw_date: str, fn: dict) -> date:
+    """
+    Resolve the prediction date.  If 'today' and all games are already
+    final, auto-advance to tomorrow and log a clear explanation.
+    """
+    if raw_date != "today":
+        from dateutil.parser import parse as dparse
+        return dparse(raw_date).date()
+
+    today     = date.today()
+    tomorrow  = today + timedelta(days=1)
+
+    games_today = fn["get_schedule"](today)
+    matchups    = fn["extract_matchups"](games_today, skip_final=True)
+
+    if matchups:
+        return today
+
+    if games_today:
+        # Games existed but all are final — it's late, switch to tomorrow
+        log.warning(
+            "All %d game(s) on %s are already final (ran after games ended). "
+            "Switching to tomorrow: %s.",
+            len(games_today), today, tomorrow,
+        )
+        return tomorrow
+
+    # No games at all today (off day) — try tomorrow
+    log.info("No games scheduled for %s — trying %s.", today, tomorrow)
+    return tomorrow
+
+
 def run(config: dict, dry_run: bool = False) -> list[dict]:
-    fn = _import_pipeline()
+    fn        = _import_pipeline()
     pred_cfg  = config.get("prediction", {})
     model_cfg = config.get("model", {})
 
-    # ── Date ─────────────────────────────────────────────────────────────────
-    raw_date = pred_cfg.get("date", "today")
-    if raw_date == "today":
-        game_date = date.today()
-    else:
-        from dateutil.parser import parse as dparse
-        game_date = dparse(raw_date).date()
-
-    season = game_date.year
-    top_n   = int(pred_cfg.get("top_n", 10))
-    min_pa  = int(pred_cfg.get("min_pa_season", 30))
-    min_games = int(pred_cfg.get("min_games_played", 10))
-
-    # ── Load XGBoost model (graceful fallback if not trained yet) ─────────────
+    # ── Load model ────────────────────────────────────────────────────────────
     xgb_model, xgb_meta = fn["load_model"]()
     if xgb_model is not None:
         log.info(
@@ -130,24 +130,35 @@ def run(config: dict, dry_run: bool = False) -> list[dict]:
             xgb_meta.get("cv_r2", 0), xgb_meta.get("n_training", 0),
         )
     else:
-        log.info("ℹ️  No trained model found — using statistical model only.")
-        log.info("   Run the 'Retrain HR Model' workflow to enable XGBoost.")
+        log.info("ℹ️  No trained model — using statistical model only.")
 
-    log.info("── Running predictions for %s (top %d) ──", game_date, top_n)
+    # ── Date resolution (auto-advance if today's games are done) ─────────────
+    raw_date  = pred_cfg.get("date", "today")
+    game_date = resolve_game_date(raw_date, fn)
+    season    = game_date.year
+    top_n     = int(pred_cfg.get("top_n", 10))
+    min_pa    = int(pred_cfg.get("min_pa_season", 30))
+    min_games = int(pred_cfg.get("min_games_played", 10))
+
+    log.info("── Predictions for %s (top %d) ──", game_date, top_n)
 
     # ── Schedule ──────────────────────────────────────────────────────────────
+    # If resolve_game_date already fetched today's games and found matchups,
+    # we re-use by fetching again (cheap — schedule endpoint is fast).
     games    = fn["get_schedule"](game_date)
     matchups = fn["extract_matchups"](games)
-    log.info("Processing %d matchups", len(matchups))
 
     if not matchups:
-        log.warning("No games found for %s. Exiting.", game_date)
+        log.error(
+            "No actionable games on %s after filtering. "
+            "Check the schedule or try a different date with --date YYYY-MM-DD.",
+            game_date,
+        )
         return []
 
     all_predictions: list[dict] = []
     lineups_confirmed = 0
 
-    # ── Per-game, per-batter predictions ─────────────────────────────────────
     for matchup in matchups:
         venue   = matchup["venue"]
         weather = fn["get_game_weather"](venue)
@@ -156,7 +167,7 @@ def run(config: dict, dry_run: bool = False) -> list[dict]:
             lineups_confirmed += 1
 
         for side in ("home", "away"):
-            opp_side    = "away" if side == "home" else "home"
+            opp_side     = "away" if side == "home" else "home"
             pitcher_info = matchup[f"{opp_side}_pitcher"]
             team_id      = matchup[f"{side}_team_id"]
             team_name    = matchup[f"{side}_team"]
@@ -190,7 +201,10 @@ def run(config: dict, dry_run: bool = False) -> list[dict]:
                         continue
 
                     splits     = fn["get_platoon_splits"](player_id, season)
-                    recent     = fn["get_recent_games"](player_id, season, model_cfg.get("recent_form_games", 15))
+                    recent     = fn["get_recent_games"](
+                        player_id, season,
+                        model_cfg.get("recent_form_games", 15),
+                    )
                     sc_metrics = fn["get_batter_statcast_metrics"](player_id, season)
 
                     pred = fn["ensemble_predict"](
@@ -209,7 +223,6 @@ def run(config: dict, dry_run: bool = False) -> list[dict]:
                         xgb_model=xgb_model,
                         xgb_meta=xgb_meta,
                     )
-
                     pred.update({
                         "player_id":        player_id,
                         "player_name":      info.get("fullName", "Unknown"),
@@ -227,33 +240,30 @@ def run(config: dict, dry_run: bool = False) -> list[dict]:
                 except Exception as exc:
                     log.warning("Prediction failed for player %d: %s", player_id, exc)
 
-    # ── Rank and trim ─────────────────────────────────────────────────────────
     all_predictions.sort(key=lambda x: x["hr_probability"], reverse=True)
     top_predictions = all_predictions[:top_n]
 
     log.info("Top %d from %d candidates:", top_n, len(all_predictions))
     for i, p in enumerate(top_predictions, 1):
-        src = p.get("rate_source", "?")
         log.info(
             "  %2d. %-25s %s  conf=%s  src=%s",
-            i, p["player_name"], p["hr_pct"], p["confidence_tier"], src,
+            i, p["player_name"], p["hr_pct"],
+            p["confidence_tier"], p.get("rate_source", "?"),
         )
 
-    # ── Email ─────────────────────────────────────────────────────────────────
     if not dry_run:
-        now_utc    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-        email_cfg  = config.get("email", {})
-        subject_t  = email_cfg.get("subject", "⚾ Top {n} HR Predictions — {date}")
+        now_utc   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+        email_cfg = config.get("email", {})
         sent = fn["send_email"](
             predictions=top_predictions,
             prediction_date=game_date.strftime("%A, %B %-d, %Y"),
             games_today=len(matchups),
             lineups_confirmed=lineups_confirmed,
             generated_at=now_utc,
-            subject_template=subject_t,
+            subject_template=email_cfg.get("subject", "⚾ Top {n} HR Predictions — {date}"),
         )
         if sent:
-            log.info("✅ Email delivered successfully.")
+            log.info("✅ Email delivered.")
         else:
             log.error("❌ Email delivery failed.")
             sys.exit(1)
@@ -265,12 +275,12 @@ def run(config: dict, dry_run: bool = False) -> list[dict]:
 
 def parse_args():
     p = argparse.ArgumentParser(description="MLB HR Prediction Pipeline")
-    p.add_argument("--config",      default="config.yml")
-    p.add_argument("--date",        help="YYYY-MM-DD or 'today'")
-    p.add_argument("--top-n",       type=int)
-    p.add_argument("--dry-run",     action="store_true")
-    p.add_argument("--test-email",  action="store_true")
-    p.add_argument("--retrain",     action="store_true", help="Retrain model before predicting")
+    p.add_argument("--config",     default="config.yml")
+    p.add_argument("--date",       help="YYYY-MM-DD or 'today'")
+    p.add_argument("--top-n",      type=int)
+    p.add_argument("--dry-run",    action="store_true")
+    p.add_argument("--test-email", action="store_true")
+    p.add_argument("--retrain",    action="store_true")
     return p.parse_args()
 
 
@@ -282,11 +292,8 @@ if __name__ == "__main__":
         config.setdefault("prediction", {})["date"] = args.date
     if args.top_n:
         config.setdefault("prediction", {})["top_n"] = args.top_n
-
     if args.retrain:
-        log.info("── Retraining model before predictions ──")
         from src.models.train import train
         train()
 
-    dry = args.dry_run and not args.test_email
-    run(config, dry_run=dry)
+    run(config, dry_run=args.dry_run and not args.test_email)
