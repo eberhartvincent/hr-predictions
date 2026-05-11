@@ -36,7 +36,7 @@ email:
 weather:
   # Stadiums with retractable/permanent roofs — weather ignored
   covered_stadiums:
-    - "Minute Maid Park"
+    - "Daikin Park"
     - "Globe Life Field"
     - "American Family Field"
     - "Chase Field"
