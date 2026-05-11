@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 """
 main.py — MLB HR Prediction Pipeline
+
+Performance model
+-----------------
+Serial fetching for 270 batters × 4 API calls × 0.12 s sleep ≈ 11 min.
+Parallel fetching with ThreadPoolExecutor(20 workers)             ≈ 1 min.
+
+The pipeline runs in two phases:
+  Phase 1 — Parallel data fetch
+    Collect all unique player / pitcher IDs across every matchup,
+    fetch each player's stats, splits, game log, and Statcast metrics
+    concurrently, store in an in-memory cache.
+
+  Phase 2 — Serial prediction
+    Iterate matchups using only the cache — zero additional API calls.
 """
 from __future__ import annotations
 
@@ -8,6 +22,7 @@ import argparse
 import logging
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 
 import yaml
@@ -20,6 +35,11 @@ logging.basicConfig(
 logging.getLogger("matplotlib").setLevel(logging.ERROR)
 log = logging.getLogger("main")
 
+# Parallel workers for API calls.
+# MLB API is permissive; pybaseball Statcast is slower so fewer workers.
+MLB_API_WORKERS  = 20
+STATCAST_WORKERS = 8
+
 
 def _import_pipeline():
     from src.data.mlb_client import (
@@ -28,7 +48,7 @@ def _import_pipeline():
         get_roster, get_schedule,
     )
     from src.data.statcast_client import (
-        get_batter_statcast_metrics, get_pitcher_statcast_metrics,
+        get_batter_statcast_metrics,
     )
     from src.data.weather_client import get_game_weather
     from src.models.predictor import ensemble_predict
@@ -45,7 +65,6 @@ def _import_pipeline():
         "get_platoon_splits":          get_platoon_splits,
         "get_recent_games":            get_recent_games,
         "get_batter_statcast_metrics": get_batter_statcast_metrics,
-        "get_pitcher_statcast_metrics":get_pitcher_statcast_metrics,
         "get_game_weather":            get_game_weather,
         "ensemble_predict":            ensemble_predict,
         "send_email":                  send_email,
@@ -63,11 +82,154 @@ def load_config(path: str = "config.yml") -> dict:
     return cfg
 
 
+# ---------------------------------------------------------------------------
+# Phase 1 helpers — parallel data fetching
+# ---------------------------------------------------------------------------
+
+def _fetch_batter_bundle(fn, player_id: int, season: int, recent_n: int) -> dict:
+    """Fetch all data needed for one batter in a single thread."""
+    info    = fn["get_player_info"](player_id)
+    stats   = fn["get_batter_stats"](player_id, season)
+    splits  = fn["get_platoon_splits"](player_id, season)
+    recent  = fn["get_recent_games"](player_id, season, recent_n)
+    return {
+        "info":   info,
+        "stats":  stats,
+        "splits": splits,
+        "recent": recent,
+    }
+
+
+def _fetch_statcast_bundle(fn, player_id: int, season: int) -> dict:
+    """Fetch Statcast metrics for one batter (slower — separate pool)."""
+    try:
+        return fn["get_batter_statcast_metrics"](player_id, season)
+    except Exception as exc:
+        log.debug("Statcast failed for player %d: %s", player_id, exc)
+        return {}
+
+
+def _fetch_pitcher_bundle(fn, pitcher_id: int, season: int) -> dict:
+    """Fetch pitcher stats."""
+    try:
+        return fn["get_pitcher_stats"](pitcher_id, season)
+    except Exception as exc:
+        log.debug("Pitcher stats failed %d: %s", pitcher_id, exc)
+        return {"season_stats": {}, "career_stats": {}}
+
+
+def prefetch_all(
+    fn,
+    matchups: list[dict],
+    season: int,
+    recent_n: int,
+) -> tuple[dict, dict, dict, dict]:
+    """
+    Phase 1: fetch all player and pitcher data in parallel.
+
+    Returns
+    -------
+    batter_cache   : {player_id: {info, stats, splits, recent}}
+    statcast_cache : {player_id: metrics_dict}
+    pitcher_cache  : {pitcher_id: {season_stats, career_stats}}
+    weather_cache  : {venue: weather_dict}
+    """
+    # Collect unique IDs
+    all_batter_ids : set[int] = set()
+    all_pitcher_ids: set[int] = set()
+    all_venues     : set[str] = set()
+
+    for m in matchups:
+        all_venues.add(m["venue"])
+        for side in ("home", "away"):
+            opp = "away" if side == "home" else "home"
+            p   = m[f"{opp}_pitcher"]
+            if p:
+                all_pitcher_ids.add(p["id"])
+            for pid in m[f"{side}_lineup"]:
+                all_batter_ids.add(pid)
+
+    log.info(
+        "Prefetching: %d batters, %d pitchers, %d venues …",
+        len(all_batter_ids), len(all_pitcher_ids), len(all_venues),
+    )
+
+    # ── Weather (fast — one OWM call per venue) ───────────────────────────
+    weather_cache: dict[str, dict] = {}
+    for venue in all_venues:
+        weather_cache[venue] = fn["get_game_weather"](venue)
+
+    # ── Pitcher stats ─────────────────────────────────────────────────────
+    pitcher_cache: dict[int, dict] = {}
+    with ThreadPoolExecutor(max_workers=MLB_API_WORKERS) as pool:
+        futures = {
+            pool.submit(_fetch_pitcher_bundle, fn, pid, season): pid
+            for pid in all_pitcher_ids
+        }
+        for fut in as_completed(futures):
+            pid = futures[fut]
+            try:
+                pitcher_cache[pid] = fut.result()
+            except Exception as exc:
+                log.warning("Pitcher prefetch failed %d: %s", pid, exc)
+                pitcher_cache[pid] = {"season_stats": {}, "career_stats": {}}
+    log.info("Pitchers fetched: %d", len(pitcher_cache))
+
+    # ── Batter MLB API stats (info, season/career, splits, game log) ──────
+    batter_cache: dict[int, dict] = {}
+    with ThreadPoolExecutor(max_workers=MLB_API_WORKERS) as pool:
+        futures = {
+            pool.submit(_fetch_batter_bundle, fn, pid, season, recent_n): pid
+            for pid in all_batter_ids
+        }
+        done = 0
+        for fut in as_completed(futures):
+            pid = futures[fut]
+            try:
+                batter_cache[pid] = fut.result()
+            except Exception as exc:
+                log.warning("Batter prefetch failed %d: %s", pid, exc)
+                batter_cache[pid] = {
+                    "info": {}, "stats": {"season_stats": {}, "career_stats": {}},
+                    "splits": {}, "recent": [],
+                }
+            done += 1
+            if done % 50 == 0:
+                log.info("  MLB API: %d/%d batters fetched …", done, len(all_batter_ids))
+    log.info("Batters fetched: %d", len(batter_cache))
+
+    # ── Statcast (slower — separate pool with fewer workers) ─────────────
+    statcast_cache: dict[int, dict] = {}
+    with ThreadPoolExecutor(max_workers=STATCAST_WORKERS) as pool:
+        futures = {
+            pool.submit(_fetch_statcast_bundle, fn, pid, season): pid
+            for pid in all_batter_ids
+        }
+        done = 0
+        for fut in as_completed(futures):
+            pid = futures[fut]
+            try:
+                statcast_cache[pid] = fut.result()
+            except Exception as exc:
+                log.debug("Statcast prefetch failed %d: %s", pid, exc)
+                statcast_cache[pid] = {}
+            done += 1
+            if done % 50 == 0:
+                log.info("  Statcast: %d/%d batters fetched …", done, len(all_batter_ids))
+    log.info("Statcast fetched: %d", len(statcast_cache))
+
+    return batter_cache, statcast_cache, pitcher_cache, weather_cache
+
+
+# ---------------------------------------------------------------------------
+# Roster fallback (when lineup not announced)
+# ---------------------------------------------------------------------------
+
 def _probable_lineup(fn, team_id: int, season: int, min_games: int) -> list[int]:
     try:
         roster = fn["get_roster"](team_id)
     except Exception as exc:
-        log.warning("Roster fetch failed for team %d: %s", team_id, exc)
+        log.warning("Roster fetch failed team %d: %s", team_id, exc)
         return []
     players = []
     for entry in roster:
@@ -85,17 +247,17 @@ def _probable_lineup(fn, team_id: int, season: int, min_games: int) -> list[int]
     return players
 
 
+# ---------------------------------------------------------------------------
+# Date resolution
+# ---------------------------------------------------------------------------
+
 def resolve_game_date(raw_date: str, fn: dict) -> date:
-    """
-    Resolve the prediction date.  If 'today' and all games are already
-    final, auto-advance to tomorrow and log a clear explanation.
-    """
     if raw_date != "today":
         from dateutil.parser import parse as dparse
         return dparse(raw_date).date()
 
-    today     = date.today()
-    tomorrow  = today + timedelta(days=1)
+    today    = date.today()
+    tomorrow = today + timedelta(days=1)
 
     games_today = fn["get_schedule"](today)
     matchups    = fn["extract_matchups"](games_today, skip_final=True)
@@ -104,109 +266,101 @@ def resolve_game_date(raw_date: str, fn: dict) -> date:
         return today
 
     if games_today:
-        # Games existed but all are final — it's late, switch to tomorrow
         log.warning(
-            "All %d game(s) on %s are already final (ran after games ended). "
-            "Switching to tomorrow: %s.",
+            "All %d game(s) on %s are already final — switching to %s.",
             len(games_today), today, tomorrow,
         )
         return tomorrow
 
-    # No games at all today (off day) — try tomorrow
-    log.info("No games scheduled for %s — trying %s.", today, tomorrow)
+    log.info("No games on %s — trying %s.", today, tomorrow)
     return tomorrow
 
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
 
 def run(config: dict, dry_run: bool = False) -> list[dict]:
     fn        = _import_pipeline()
     pred_cfg  = config.get("prediction", {})
     model_cfg = config.get("model", {})
 
-    # ── Load model ────────────────────────────────────────────────────────────
+    # ── Model ─────────────────────────────────────────────────────────────
     xgb_model, xgb_meta = fn["load_model"]()
     if xgb_model is not None:
         log.info(
-            "✅ XGBoost model loaded (R²=%.4f, trained on %d examples)",
+            "✅ XGBoost model loaded (R²=%.4f, n=%d)",
             xgb_meta.get("cv_r2", 0), xgb_meta.get("n_training", 0),
         )
     else:
         log.info("ℹ️  No trained model — using statistical model only.")
 
-    # ── Date resolution (auto-advance if today's games are done) ─────────────
-    raw_date  = pred_cfg.get("date", "today")
-    game_date = resolve_game_date(raw_date, fn)
+    # ── Date ──────────────────────────────────────────────────────────────
+    game_date = resolve_game_date(pred_cfg.get("date", "today"), fn)
     season    = game_date.year
     top_n     = int(pred_cfg.get("top_n", 10))
     min_pa    = int(pred_cfg.get("min_pa_season", 30))
     min_games = int(pred_cfg.get("min_games_played", 10))
+    recent_n  = int(model_cfg.get("recent_form_games", 15))
 
     log.info("── Predictions for %s (top %d) ──", game_date, top_n)
 
-    # ── Schedule ──────────────────────────────────────────────────────────────
-    # If resolve_game_date already fetched today's games and found matchups,
-    # we re-use by fetching again (cheap — schedule endpoint is fast).
+    # ── Schedule ──────────────────────────────────────────────────────────
     games    = fn["get_schedule"](game_date)
     matchups = fn["extract_matchups"](games)
 
     if not matchups:
-        log.error(
-            "No actionable games on %s after filtering. "
-            "Check the schedule or try a different date with --date YYYY-MM-DD.",
-            game_date,
-        )
+        log.error("No actionable games on %s.", game_date)
         return []
 
+    # Fill in any missing lineups via roster before prefetch
+    for m in matchups:
+        for side in ("home", "away"):
+            if not m[f"{side}_lineup"]:
+                m[f"{side}_lineup"] = _probable_lineup(
+                    fn, m[f"{side}_team_id"], season, min_games
+                )
+
+    # ── Phase 1: parallel data fetch ──────────────────────────────────────
+    batter_cache, statcast_cache, pitcher_cache, weather_cache = prefetch_all(
+        fn, matchups, season, recent_n
+    )
+
+    # ── Phase 2: predictions (cache only — no more API calls) ─────────────
     all_predictions: list[dict] = []
-    lineups_confirmed = 0
+    lineups_confirmed = sum(1 for m in matchups if m["lineup_confirmed"])
 
     for matchup in matchups:
         venue   = matchup["venue"]
-        weather = fn["get_game_weather"](venue)
-
-        if matchup["lineup_confirmed"]:
-            lineups_confirmed += 1
+        weather = weather_cache.get(venue, {})
 
         for side in ("home", "away"):
-            opp_side     = "away" if side == "home" else "home"
-            pitcher_info = matchup[f"{opp_side}_pitcher"]
-            team_id      = matchup[f"{side}_team_id"]
+            opp          = "away" if side == "home" else "home"
+            pitcher_info = matchup[f"{opp}_pitcher"]
             team_name    = matchup[f"{side}_team"]
 
             if pitcher_info is None:
                 continue
 
-            try:
-                p_stats  = fn["get_pitcher_stats"](pitcher_info["id"], season)
-                p_season = p_stats["season_stats"]
-                p_career = p_stats["career_stats"]
-            except Exception as exc:
-                log.warning("Pitcher stats failed %s: %s", pitcher_info["fullName"], exc)
-                p_season, p_career = {}, {}
+            p_data   = pitcher_cache.get(pitcher_info["id"], {})
+            p_season = p_data.get("season_stats", {})
+            p_career = p_data.get("career_stats", {})
 
-            lineup_ids = matchup[f"{side}_lineup"] or _probable_lineup(
-                fn, team_id, season, min_games
-            )
+            for player_id in matchup[f"{side}_lineup"]:
+                b_data = batter_cache.get(player_id, {})
+                info   = b_data.get("info", {})
 
-            for player_id in lineup_ids:
+                if info.get("position") in ("P", "SP", "RP"):
+                    continue
+
+                b_stats  = b_data.get("stats", {})
+                b_season = b_stats.get("season_stats", {})
+                b_career = b_stats.get("career_stats", {})
+
+                if int(b_season.get("plateAppearances", 0)) < min_pa:
+                    continue
+
                 try:
-                    info = fn["get_player_info"](player_id)
-                    if info.get("position") in ("P", "SP", "RP"):
-                        continue
-
-                    b_stats  = fn["get_batter_stats"](player_id, season)
-                    b_season = b_stats["season_stats"]
-                    b_career = b_stats["career_stats"]
-
-                    if int(b_season.get("plateAppearances", 0)) < min_pa:
-                        continue
-
-                    splits     = fn["get_platoon_splits"](player_id, season)
-                    recent     = fn["get_recent_games"](
-                        player_id, season,
-                        model_cfg.get("recent_form_games", 15),
-                    )
-                    sc_metrics = fn["get_batter_statcast_metrics"](player_id, season)
-
                     pred = fn["ensemble_predict"](
                         batter_season=b_season,
                         batter_career=b_career,
@@ -214,9 +368,9 @@ def run(config: dict, dry_run: bool = False) -> list[dict]:
                         pitcher_career=p_career,
                         pitcher_throws=pitcher_info.get("throws", "R"),
                         batter_bats=info.get("bats", "R"),
-                        platoon_splits=splits,
-                        recent_games=recent,
-                        statcast_metrics=sc_metrics,
+                        platoon_splits=b_data.get("splits", {}),
+                        recent_games=b_data.get("recent", []),
+                        statcast_metrics=statcast_cache.get(player_id, {}),
                         venue=venue,
                         weather=weather,
                         config=config,
@@ -236,9 +390,8 @@ def run(config: dict, dry_run: bool = False) -> list[dict]:
                         "lineup_confirmed": matchup["lineup_confirmed"],
                     })
                     all_predictions.append(pred)
-
                 except Exception as exc:
-                    log.warning("Prediction failed for player %d: %s", player_id, exc)
+                    log.warning("Prediction failed player %d: %s", player_id, exc)
 
     all_predictions.sort(key=lambda x: x["hr_probability"], reverse=True)
     top_predictions = all_predictions[:top_n]
@@ -251,16 +404,18 @@ def run(config: dict, dry_run: bool = False) -> list[dict]:
             p["confidence_tier"], p.get("rate_source", "?"),
         )
 
+    # ── Email ─────────────────────────────────────────────────────────────
     if not dry_run:
-        now_utc   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-        email_cfg = config.get("email", {})
+        now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
         sent = fn["send_email"](
             predictions=top_predictions,
             prediction_date=game_date.strftime("%A, %B %-d, %Y"),
             games_today=len(matchups),
             lineups_confirmed=lineups_confirmed,
             generated_at=now_utc,
-            subject_template=email_cfg.get("subject", "⚾ Top {n} HR Predictions — {date}"),
+            subject_template=config.get("email", {}).get(
+                "subject", "⚾ Top {n} HR Predictions — {date}"
+            ),
         )
         if sent:
             log.info("✅ Email delivered.")
@@ -272,6 +427,10 @@ def run(config: dict, dry_run: bool = False) -> list[dict]:
 
     return top_predictions
 
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def parse_args():
     p = argparse.ArgumentParser(description="MLB HR Prediction Pipeline")
@@ -287,7 +446,6 @@ def parse_args():
 if __name__ == "__main__":
     args   = parse_args()
     config = load_config(args.config)
-
     if args.date:
         config.setdefault("prediction", {})["date"] = args.date
     if args.top_n:
@@ -295,5 +453,4 @@ if __name__ == "__main__":
     if args.retrain:
         from src.models.train import train
         train()
-
     run(config, dry_run=args.dry_run and not args.test_email)
