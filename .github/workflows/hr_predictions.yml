@@ -132,6 +132,9 @@ jobs:
           if [ "${{ steps.resolve.outputs.dry_run }}" = "true" ]; then
             DRY_FLAG="--dry-run"
           fi
+          echo "SENDER set: ${{ env.EMAIL_SENDER != '' }}"
+          echo "PASSWORD set: ${{ env.EMAIL_PASSWORD != '' }}"
+          echo "RECIPIENTS set: ${{ env.EMAIL_RECIPIENTS != '' }}"
 
           python main.py \
             --date "${{ steps.resolve.outputs.date }}" \
