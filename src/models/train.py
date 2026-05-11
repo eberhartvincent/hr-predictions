@@ -1,23 +1,32 @@
 """
 train.py
 ========
-Weekly retraining script for the XGBoost HR-rate talent estimator.
+Weekly retraining for the XGBoost HR-rate talent estimator.
 
-Data sources (both from Baseball Savant — no auth required)
------------------------------------------------------------
-1. Statcast barrels/EV leaderboard  → barrel %, exit velo, launch angle,
-                                       sweet spot %, hard hit %
-2. Expected statistics leaderboard  → PA, HR, ISO, K%, BB%, xwOBA
+Three data sources, all free, all confirmed working from GitHub Actions:
 
-Both are joined on player_id (MLBAM ID).
+  Source 1 — Baseball Savant barrels leaderboard (CSV)
+    Confirmed columns: player_id, attempts, avg_hit_angle,
+    anglesweetspotpercent, avg_hit_speed, ev95percent,
+    barrels, brl_percent, brl_pa
 
-Approach: Year-N features → Year-(N+1) HR/PA  (no look-ahead bias)
+  Source 2 — Baseball Savant expected-stats leaderboard (CSV)
+    Confirmed columns: player_id, year, pa, bip, ba, slg,
+    woba, est_woba (xwOBA)
+    NOTE: no home_run column — HR comes from source 3.
+
+  Source 3 — MLB Stats API  (already used by daily predictions)
+    One GET per season — returns HR, PA, K%, BB%, ISO per player.
+    player_id is MLBAM ID — matches Savant exactly.
+
+Training: Year-N features → Year-(N+1) HR/PA rate (no look-ahead bias).
 """
 from __future__ import annotations
 
 import io
 import json
 import logging
+import time
 import warnings
 from pathlib import Path
 
@@ -36,251 +45,233 @@ MODEL_PATH = MODEL_DIR / "hr_model.json"
 META_PATH  = MODEL_DIR / "feature_metadata.json"
 
 MIN_PA = 150
-HEADERS = {"User-Agent": "hr-predictor/1.0 (github-actions; open-source)"}
+SAVANT_HEADERS = {"User-Agent": "hr-predictor/1.0 (github-actions; open-source)"}
+MLB_HEADERS    = {"User-Agent": "hr-predictor/1.0 (github-actions)"}
 
 # ---------------------------------------------------------------------------
-# Confirmed Baseball Savant column names (from live API response 2025-05-11)
+# Confirmed column names from live API responses (2025-05-11)
 # ---------------------------------------------------------------------------
 
-# Endpoint 1: exit velo / barrels leaderboard
-# https://baseballsavant.mlb.com/leaderboard/statcast?type=batter&year=X&min=Y&csv=true
-# Confirmed columns: last_name, first_name, player_id, attempts, avg_hit_angle,
-#   anglesweetspotpercent, max_hit_speed, avg_hit_speed, ev50, fbld, gb,
-#   max_distance, avg_distance, avg_hr_distance, ev95plus, ev95percent,
-#   barrels, brl_percent, brl_pa
+# Source 1: barrels leaderboard
 BARRELS_URL = (
     "https://baseballsavant.mlb.com/leaderboard/statcast"
-    "?type=batter&year={year}&position=&team=&min={min_pa}&csv=true"
+    "?type=batter&year={year}&position=&team=&min=50&csv=true"
 )
-BARRELS_COLS = {
-    # canonical          actual Savant column
-    "barrel_pct":        "brl_percent",        # barrels per batted ball
-    "barrel_pa":         "brl_pa",             # barrels per PA (tighter signal)
-    "exit_velocity":     "avg_hit_speed",      # average exit velo (mph)
-    "launch_angle":      "avg_hit_angle",      # average launch angle (degrees)
-    "sweet_spot_pct":    "anglesweetspotpercent",  # LA 8–32° sweet spot
-    "hard_hit_pct":      "ev95percent",        # % batted balls ≥ 95 mph
-    "n_batted_balls":    "attempts",           # sample size
+BARRELS_FEATURE_MAP = {
+    # canonical name      actual CSV column
+    "barrel_pct":         "brl_percent",
+    "barrel_pa":          "brl_pa",
+    "exit_velocity":      "avg_hit_speed",
+    "launch_angle":       "avg_hit_angle",
+    "sweet_spot_pct":     "anglesweetspotpercent",
+    "hard_hit_pct":       "ev95percent",
+    "n_batted_balls":     "attempts",
 }
 
-# Endpoint 2: expected statistics leaderboard
-# https://baseballsavant.mlb.com/leaderboard/expected_statistics?type=batter&year=X&min=Y&csv=true
-# Returns: player_id, pa, home_run, k_percent, bb_percent, isolated_power,
-#   exit_velocity_avg, launch_angle_avg, sweet_spot_percent, barrel_batted_rate,
-#   hard_hit_percent, est_woba (xwOBA), etc.
+# Source 2: expected-stats leaderboard
 XSTATS_URL = (
     "https://baseballsavant.mlb.com/leaderboard/expected_statistics"
-    "?type=batter&year={year}&position=&team=&min={min_pa}&csv=true"
+    "?type=batter&year={year}&position=&team=&min=50&csv=true"
 )
-XSTATS_COLS = {
-    "pa":         ["pa", "PA"],
-    "home_run":   ["home_run", "HR", "hr"],
-    "iso":        ["isolated_power", "iso", "ISO"],
-    "k_pct":      ["k_percent", "strikeout_percent", "k%"],
-    "bb_pct":     ["bb_percent", "walk_percent", "bb%"],
-    "xwoba":      ["est_woba", "xwoba", "expected_woba"],
-    # Fallback Statcast metrics if barrels endpoint is missing something
-    "ev_xstats":  ["exit_velocity_avg", "avg_exit_velocity"],
-    "la_xstats":  ["launch_angle_avg", "avg_launch_angle"],
-    "hh_xstats":  ["hard_hit_percent", "hard_hit_pct"],
-    "brl_xstats": ["barrel_batted_rate", "barrel_pct"],
+XSTATS_FEATURE_MAP = {
+    "xwoba":  "est_woba",   # expected wOBA — strong HR-talent signal
+    "woba":   "woba",       # actual wOBA   — useful cross-check
+    "xslg":   "est_slg",    # expected SLG
 }
 
-# Final feature list for XGBoost (subset that stabilizes well year-over-year)
+# Source 3: MLB Stats API
+MLB_STATS_URL = "https://statsapi.mlb.com/api/v1/stats"
+
+# Final XGBoost features (subset that's consistently available + HR-predictive)
 FEATURES = [
-    "barrel_pct",     # strongest single HR predictor
-    "barrel_pa",      # barrels per PA (slightly different angle)
+    "barrel_pct",     # barrels / batted balls — #1 HR predictor
+    "barrel_pa",      # barrels / PA — tighter signal
     "exit_velocity",  # raw power
-    "hard_hit_pct",   # contact quality floor
-    "launch_angle",   # trajectory (higher → more fly balls → more HR potential)
-    "sweet_spot_pct", # optimal contact zone
-    "xwoba",          # expected wOBA — absorbs multiple Statcast signals
-    "iso",            # isolated power (SLG - AVG) — traditional power metric
-    "k_pct",          # K% — useful non-linearity (extreme Ks can correlate with power)
-    "bb_pct",         # BB% — plate discipline / pitch recognition
+    "hard_hit_pct",   # EV ≥ 95 mph %
+    "launch_angle",   # avg trajectory
+    "sweet_spot_pct", # optimal LA zone
+    "xwoba",          # expected wOBA (absorbs EV + LA + contact type)
+    "iso",            # isolated power (traditional power gauge)
+    "k_pct",          # strikeout rate (non-linear HR correlation)
+    "bb_pct",         # walk rate (pitch recognition)
 ]
 
 
 # ---------------------------------------------------------------------------
-# Fetch helpers
+# Source 1 — Baseball Savant barrels leaderboard
 # ---------------------------------------------------------------------------
 
-def _fetch_csv(url: str, label: str) -> pd.DataFrame | None:
+def fetch_barrels(year: int) -> pd.DataFrame:
+    url = BARRELS_URL.format(year=year)
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=30)
-        resp.raise_for_status()
-        df = pd.read_csv(io.StringIO(resp.text))
-        if df.empty:
-            log.warning("%s returned empty CSV.", label)
-            return None
-        log.info("%s: %d rows, columns: %s", label, len(df), df.columns.tolist())
-        return df
+        r = requests.get(url, headers=SAVANT_HEADERS, timeout=30)
+        r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.text))
+        log.info("barrels/%d: %d rows", year, len(df))
+        df["player_id"] = pd.to_numeric(df["player_id"], errors="coerce")
+        out = df[["player_id"]].copy()
+        for canonical, col in BARRELS_FEATURE_MAP.items():
+            out[canonical] = pd.to_numeric(df.get(col, np.nan), errors="coerce")
+        return out.dropna(subset=["player_id"])
     except Exception as exc:
-        log.warning("Failed to fetch %s: %s", label, exc)
-        return None
-
-
-def _first_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    """Return the first candidate column name that exists in df."""
-    return next((c for c in candidates if c in df.columns), None)
+        log.warning("barrels/%d failed: %s", year, exc)
+        return pd.DataFrame()
 
 
 # ---------------------------------------------------------------------------
-# Per-year data assembly
+# Source 2 — Baseball Savant expected-stats leaderboard
 # ---------------------------------------------------------------------------
 
-def fetch_year(year: int, min_pa: int = MIN_PA) -> pd.DataFrame | None:
+def fetch_xstats(year: int) -> pd.DataFrame:
+    url = XSTATS_URL.format(year=year)
+    try:
+        r = requests.get(url, headers=SAVANT_HEADERS, timeout=30)
+        r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.text))
+        log.info("xstats/%d: %d rows, cols: %s", year, len(df), df.columns.tolist())
+        df["player_id"] = pd.to_numeric(df["player_id"], errors="coerce")
+        out = df[["player_id"]].copy()
+        # pa is in xstats — useful for the merge filter
+        out["pa_xstats"] = pd.to_numeric(df.get("pa", np.nan), errors="coerce")
+        for canonical, col in XSTATS_FEATURE_MAP.items():
+            out[canonical] = pd.to_numeric(df.get(col, np.nan), errors="coerce")
+        return out.dropna(subset=["player_id"])
+    except Exception as exc:
+        log.warning("xstats/%d failed: %s", year, exc)
+        return pd.DataFrame()
+
+
+# ---------------------------------------------------------------------------
+# Source 3 — MLB Stats API (one call per year)
+# ---------------------------------------------------------------------------
+
+def fetch_mlb_stats(year: int) -> pd.DataFrame:
     """
-    Fetch and join both Savant leaderboards for one year.
-    Returns a tidy DataFrame keyed by player_id, or None on failure.
+    Pull full-season hitting stats from the MLB Stats API.
+    Returns player_id, hr, pa, k_pct, bb_pct, iso per qualified batter.
     """
-    # ── Barrels leaderboard ──────────────────────────────────────────────────
-    df_brl = _fetch_csv(
-        BARRELS_URL.format(year=year, min_pa=50),   # lower threshold — filter on PA later
-        f"barrels/{year}",
-    )
-
-    # ── Expected stats leaderboard ───────────────────────────────────────────
-    df_xs = _fetch_csv(
-        XSTATS_URL.format(year=year, min_pa=min_pa),
-        f"xstats/{year}",
-    )
-
-    if df_xs is None:
-        log.warning("Year %d skipped — no expected-stats data.", year)
-        return None
-
-    # Identify player_id column in each frame
-    id_col_xs  = _first_col(df_xs,  ["player_id", "IDfg", "mlbam_id"])
-    id_col_brl = _first_col(df_brl, ["player_id", "IDfg", "mlbam_id"]) if df_brl is not None else None
-
-    if id_col_xs is None:
-        log.warning("Year %d: no player_id in xstats. Columns: %s", year, df_xs.columns.tolist())
-        return None
-
-    # ── Extract target (PA + HR) from xstats ────────────────────────────────
-    pa_col = _first_col(df_xs, XSTATS_COLS["pa"])
-    hr_col = _first_col(df_xs, XSTATS_COLS["home_run"])
-
-    if pa_col is None or hr_col is None:
-        log.warning(
-            "Year %d: missing pa/hr columns in xstats. Available: %s",
-            year, df_xs.columns.tolist(),
+    try:
+        r = requests.get(
+            MLB_STATS_URL,
+            params={"stats": "season", "group": "hitting",
+                    "season": year, "sportId": 1, "limit": 2000},
+            headers=MLB_HEADERS,
+            timeout=30,
         )
-        return None
+        r.raise_for_status()
+        data = r.json()
+    except Exception as exc:
+        log.warning("MLB API stats/%d failed: %s", year, exc)
+        return pd.DataFrame()
 
-    df_xs = df_xs.copy()
-    df_xs["_pid"]  = pd.to_numeric(df_xs[id_col_xs], errors="coerce")
-    df_xs["_pa"]   = pd.to_numeric(df_xs[pa_col], errors="coerce")
-    df_xs["_hr"]   = pd.to_numeric(df_xs[hr_col], errors="coerce")
-    df_xs = df_xs[df_xs["_pa"] >= min_pa].copy()
-
-    # ── Pull xstats features ─────────────────────────────────────────────────
     rows = []
-    for _, row in df_xs.iterrows():
-        pid = int(row["_pid"]) if pd.notna(row["_pid"]) else None
-        if pid is None:
-            continue
-        pa = float(row["_pa"])
-        hr = float(row["_hr"])
-
-        rec: dict = {
-            "player_id": pid,
-            "season":    year,
-            "pa":        pa,
-            "hr":        hr,
-            "hr_pa":     hr / pa,
-        }
-
-        # Extract xstats features
-        for canonical, candidates in XSTATS_COLS.items():
-            if canonical in ("pa", "home_run"):
+    for stat_group in data.get("stats", []):
+        for split in stat_group.get("splits", []):
+            player = split.get("player", {})
+            s      = split.get("stat", {})
+            pid = player.get("id")
+            if not pid:
                 continue
-            col = _first_col(df_xs, candidates if isinstance(candidates, list) else [candidates])
-            if col and col in df_xs.columns:
-                val = row.get(col, np.nan)
-                try:
-                    rec[canonical] = float(val)
-                except (TypeError, ValueError):
-                    rec[canonical] = np.nan
-            else:
-                rec[canonical] = np.nan
 
-        rows.append(rec)
+            pa  = float(s.get("plateAppearances") or 0)
+            hr  = float(s.get("homeRuns")         or 0)
+            so  = float(s.get("strikeOuts")        or 0)
+            bb  = float(s.get("baseOnBalls")       or 0)
+            slg_str = s.get("slugging", "0") or "0"
+            avg_str = s.get("avg", "0")      or "0"
 
-    df_out = pd.DataFrame(rows)
-    if df_out.empty:
-        log.warning("Year %d: no qualifying batters after PA filter.", year)
-        return None
+            try: slg = float(slg_str)
+            except ValueError: slg = 0.0
+            try: avg = float(avg_str)
+            except ValueError: avg = 0.0
 
-    # ── Merge barrels features ───────────────────────────────────────────────
-    if df_brl is not None and id_col_brl is not None:
-        df_brl = df_brl.copy()
-        df_brl["_pid"] = pd.to_numeric(df_brl[id_col_brl], errors="coerce")
+            k_pct = so / pa if pa > 0 else np.nan
+            bb_pct = bb / pa if pa > 0 else np.nan
+            iso   = slg - avg
 
-        brl_rows = {}
-        for _, brow in df_brl.iterrows():
-            pid = int(brow["_pid"]) if pd.notna(brow["_pid"]) else None
-            if pid is None:
-                continue
-            rec = {}
-            for canonical, actual in BARRELS_COLS.items():
-                if actual in df_brl.columns:
-                    try:
-                        rec[canonical] = float(brow[actual])
-                    except (TypeError, ValueError):
-                        rec[canonical] = np.nan
-                else:
-                    rec[canonical] = np.nan
-            brl_rows[pid] = rec
+            rows.append({
+                "player_id": int(pid),
+                "pa":        pa,
+                "hr":        hr,
+                "k_pct":     k_pct,
+                "bb_pct":    bb_pct,
+                "iso":       iso,
+            })
 
-        for canonical in BARRELS_COLS:
-            df_out[canonical] = df_out["player_id"].map(
-                lambda pid, c=canonical: brl_rows.get(pid, {}).get(c, np.nan)
-            )
-    else:
-        for canonical in BARRELS_COLS:
-            df_out[canonical] = np.nan
-
-    log.info("Year %d: %d qualifying batters assembled.", year, len(df_out))
-    return df_out
+    df = pd.DataFrame(rows)
+    log.info("mlb_api/%d: %d batters", year, len(df))
+    return df
 
 
 # ---------------------------------------------------------------------------
-# Training pair construction
+# Assemble one season
+# ---------------------------------------------------------------------------
+
+def fetch_year(year: int) -> pd.DataFrame | None:
+    brl  = fetch_barrels(year)
+    xs   = fetch_xstats(year)
+    mlb  = fetch_mlb_stats(year)
+
+    if mlb.empty:
+        log.warning("Year %d skipped — MLB API returned no data.", year)
+        return None
+
+    # MLB API is the authoritative source for HR + PA — start here
+    base = mlb[mlb["pa"] >= MIN_PA].copy()
+    base["season"] = year
+    base["hr_pa"]  = base["hr"] / base["pa"]
+
+    # Merge Savant barrels
+    if not brl.empty:
+        base = base.merge(brl, on="player_id", how="left")
+    else:
+        for col in BARRELS_FEATURE_MAP:
+            base[col] = np.nan
+
+    # Merge Savant xstats (xwOBA, wOBA, xSLG)
+    if not xs.empty:
+        base = base.merge(xs.drop(columns=["pa_xstats"], errors="ignore"),
+                          on="player_id", how="left")
+    else:
+        for col in XSTATS_FEATURE_MAP:
+            base[col] = np.nan
+
+    log.info("Year %d: %d qualifying batters assembled.", year, len(base))
+    return base
+
+
+# ---------------------------------------------------------------------------
+# Training pairs: Year-N → Year-(N+1) HR/PA
 # ---------------------------------------------------------------------------
 
 def build_training_pairs(
     stats: pd.DataFrame,
-    feature_cols: list[str],
+    features: list[str],
 ) -> tuple[pd.DataFrame, pd.Series]:
-    """Year-N features → Year-(N+1) HR/PA rate, matched on player_id."""
-    seasons  = sorted(stats["season"].unique())
+    seasons = sorted(stats["season"].unique())
     all_X, all_y = [], []
 
     for i in range(len(seasons) - 1):
         yr_n, yr_np1 = seasons[i], seasons[i + 1]
-        df_n   = stats[stats["season"] == yr_n].set_index("player_id")
-        df_np1 = stats[stats["season"] == yr_np1].set_index("player_id")
-        common = df_n.index.intersection(df_np1.index)
+        n   = stats[stats["season"] == yr_n].set_index("player_id")
+        np1 = stats[stats["season"] == yr_np1].set_index("player_id")
+        common = n.index.intersection(np1.index)
 
         if common.empty:
-            log.warning("No common players between %d and %d.", yr_n, yr_np1)
+            log.warning("No common players %d→%d.", yr_n, yr_np1)
             continue
 
-        X_block = df_n.loc[common, feature_cols].copy()
-        y_block = df_np1.loc[common, "hr_pa"].copy()
-        valid   = X_block.notna().any(axis=1) & y_block.notna()
+        avail = [f for f in features if f in n.columns]
+        X_b = n.loc[common, avail].copy()
+        y_b = np1.loc[common, "hr_pa"].copy()
+        valid = X_b.notna().any(axis=1) & y_b.notna()
 
-        all_X.append(X_block[valid])
-        all_y.append(y_block[valid])
-        log.info("Pair %d→%d: %d training examples", yr_n, yr_np1, valid.sum())
+        all_X.append(X_b[valid])
+        all_y.append(y_b[valid])
+        log.info("Pair %d→%d: %d examples", yr_n, yr_np1, valid.sum())
 
     if not all_X:
-        raise RuntimeError(
-            "No valid year-over-year training pairs. "
-            "Need at least two consecutive seasons with overlapping players."
-        )
+        raise RuntimeError("No valid year-over-year training pairs built.")
 
     return (
         pd.concat(all_X).reset_index(drop=True),
@@ -289,11 +280,10 @@ def build_training_pairs(
 
 
 # ---------------------------------------------------------------------------
-# Main training entry point
+# Main entry point
 # ---------------------------------------------------------------------------
 
 def train(years: list[int] | None = None) -> dict:
-    """Full pipeline. Returns metadata dict."""
     import xgboost as xgb
 
     if years is None:
@@ -301,44 +291,35 @@ def train(years: list[int] | None = None) -> dict:
 
     MODEL_DIR.mkdir(exist_ok=True)
 
-    # 1. Fetch all years
     frames = []
     for year in years:
         df = fetch_year(year)
         if df is not None:
             frames.append(df)
+        time.sleep(0.5)   # be polite between years
 
     if not frames:
-        raise RuntimeError(
-            "No data fetched from Baseball Savant. "
-            "Check network access to baseballsavant.mlb.com."
-        )
+        raise RuntimeError("No data assembled — check network and API availability.")
 
     stats = pd.concat(frames, ignore_index=True)
     log.info("Total player-seasons: %d", len(stats))
 
-    # 2. Determine usable features (enough non-null values)
-    available = [
-        f for f in FEATURES
-        if f in stats.columns and stats[f].notna().sum() >= 20
-    ]
+    available = [f for f in FEATURES if f in stats.columns
+                 and stats[f].notna().sum() >= 20]
     if len(available) < 2:
         raise RuntimeError(f"Too few usable features: {available}")
-    log.info("Training features (%d): %s", len(available), available)
+    log.info("Training on %d features: %s", len(available), available)
 
-    # 3. Build pairs
     X, y = build_training_pairs(stats, available)
-    log.info("Training set: %d examples × %d features", len(X), X.shape[1])
+    log.info("Training set: %d × %d", len(X), X.shape[1])
 
-    # 4. Impute missing with column medians
     medians = X.median()
     X = X.fillna(medians)
 
-    # 5. Cross-validated evaluation
     n_splits = min(5, max(2, len(X) // 20))
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
-    oof_preds = np.zeros(len(y))
-    fold_maes = []
+    oof = np.zeros(len(y))
+    maes = []
 
     xgb_params = dict(
         n_estimators=300, max_depth=4, learning_rate=0.05,
@@ -348,30 +329,28 @@ def train(years: list[int] | None = None) -> dict:
         random_state=42, n_jobs=-1, verbosity=0,
     )
 
-    for fold, (tr_idx, val_idx) in enumerate(kf.split(X), 1):
+    for fold, (tr, val) in enumerate(kf.split(X), 1):
         m = xgb.XGBRegressor(**xgb_params)
-        m.fit(X.iloc[tr_idx], y.iloc[tr_idx])
-        preds = np.clip(m.predict(X.iloc[val_idx]), 0, 0.15)
-        oof_preds[val_idx] = preds
-        mae = mean_absolute_error(y.iloc[val_idx], preds)
-        fold_maes.append(mae)
+        m.fit(X.iloc[tr], y.iloc[tr])
+        p = np.clip(m.predict(X.iloc[val]), 0, 0.15)
+        oof[val] = p
+        mae = mean_absolute_error(y.iloc[val], p)
+        maes.append(mae)
         log.info("  Fold %d MAE: %.5f", fold, mae)
 
-    cv_mae = float(np.mean(fold_maes))
-    cv_r2  = float(r2_score(y, oof_preds))
+    cv_mae = float(np.mean(maes))
+    cv_r2  = float(r2_score(y, oof))
     log.info("CV MAE: %.5f | CV R²: %.4f", cv_mae, cv_r2)
 
-    # 6. Final model on all data
     model = xgb.XGBRegressor(**xgb_params)
     model.fit(X, y)
+    model.save_model(str(MODEL_PATH))
 
     importance = dict(sorted(
         zip(available, model.feature_importances_.tolist()),
         key=lambda kv: -kv[1],
     ))
 
-    # 7. Save
-    model.save_model(str(MODEL_PATH))
     metadata = {
         "features":           available,
         "feature_medians":    medians[available].to_dict(),
@@ -387,10 +366,10 @@ def train(years: list[int] | None = None) -> dict:
     log.info("=" * 50)
     log.info("Training complete.")
     log.info("  Samples  : %d", len(X))
-    log.info("  Features : %s", available)
     log.info("  CV MAE   : %.5f HR/PA", cv_mae)
     log.info("  CV R²    : %.4f", cv_r2)
     log.info("  LG HR/PA : %.4f", float(y.mean()))
+    log.info("  Top features: %s", list(importance.keys())[:5])
     log.info("=" * 50)
     return metadata
 
