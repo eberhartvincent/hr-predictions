@@ -78,9 +78,9 @@ ALIASES: dict[str, str] = {
     "Marlins Park":                    "loanDepot park",
     "Oakland-Alameda County Coliseum": "Oakland Coliseum",
     "RingCentral Coliseum":            "Oakland Coliseum",
-    "Rate Field":                      "Chase Field",
+    "Rate Field":                      "Guaranteed Rate Field",
     "Dodger Stadium":                  "UNIQLO Field at Dodger Stadium",
-    "Minute Made Park":                "Daikin Park"
+    "Minute Maid Park":                "Daikin Park",
 }
 
 _KNOWN_NAMES = list(STADIUM_META.keys())
