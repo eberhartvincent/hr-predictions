@@ -90,6 +90,7 @@ def extract_matchups(games: list[dict], skip_final: bool = False) -> list[dict]:
             log.debug("Including completed game %s @ %s (historical mode)", away, home)
 
         venue  = g.get("venue", {}).get("name", "Unknown Venue")
+        log.info("Venue from API: %r", venue)  # temporary — remove after checking
         home_d = g.get("teams", {}).get("home", {})
         away_d = g.get("teams", {}).get("away", {})
 

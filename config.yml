@@ -5,7 +5,7 @@
 # GitHub Actions workflow inputs.
 
 prediction:
-  top_n: 10                  # How many players to show in the email
+  top_n: 35                  # How many players to show in the email
   date: "today"              # "today" or "YYYY-MM-DD"
   min_pa_season: 30          # Min plate appearances (season) to qualify
   min_pa_career: 100         # Min plate appearances (career) to qualify
