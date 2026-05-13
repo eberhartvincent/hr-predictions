@@ -64,7 +64,7 @@ STADIUM_META: dict[str, dict] = {
     # NL West
     "Chase Field":                    {"lat": 33.4453, "lon": -112.0667,"cf_bearing": 0,     "covered": True},
     "Coors Field":                    {"lat": 39.7559, "lon": -104.9942,"cf_bearing": 35},   # was 13 — estimated NNE
-    "Dodger Stadium":                 {"lat": 34.0739, "lon": -118.2400,"cf_bearing": 355},  # renamed back — check API name
+    "UNIQLO Field at Dodger Stadium":                 {"lat": 34.0739, "lon": -118.2400,"cf_bearing": 355},  # renamed back — check API name
     "Oracle Park":                    {"lat": 37.7785, "lon": -122.3893,"cf_bearing": 110},  # keeping yours — faces the bay
     "Petco Park":                     {"lat": 32.7076, "lon": -117.1570,"cf_bearing": 315},  # keeping yours — NW
 }
@@ -78,7 +78,7 @@ ALIASES: dict[str, str] = {
     "Marlins Park":                    "loanDepot park",
     "Oakland-Alameda County Coliseum": "Oakland Coliseum",
     "RingCentral Coliseum":            "Oakland Coliseum",
-    "Rate field":                      "Chase Field",
+    "Rate Field":                      "Chase Field",
     "Dodger Stadium":                  "UNIQLO Field at Dodger Stadium",
     "Minute Made Park":                "Daikin Park"
 }
