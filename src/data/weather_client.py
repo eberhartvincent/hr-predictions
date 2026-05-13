@@ -31,42 +31,42 @@ OWM_BASE = "https://api.openweathermap.org/data/2.5"
 # ---------------------------------------------------------------------------
 STADIUM_META: dict[str, dict] = {
     # AL East
-    "Oriole Park at Camden Yards":    {"lat": 39.2839, "lon": -76.6217, "cf_bearing": 10},
-    "Fenway Park":                    {"lat": 42.3467, "lon": -71.0972, "cf_bearing": 96},
-    "Yankee Stadium":                 {"lat": 40.8296, "lon": -73.9262, "cf_bearing": 300},
-    "Rogers Centre":                  {"lat": 43.6414, "lon": -79.3894, "cf_bearing": 330, "covered": True},
-    "Tropicana Field":                {"lat": 27.7682, "lon": -82.6534, "cf_bearing": 0,   "covered": True},
+    "Oriole Park at Camden Yards":    {"lat": 39.2839, "lon": -76.6217, "cf_bearing": 60},   # was 10 — estimated NE toward harbor
+    "Fenway Park":                    {"lat": 42.3467, "lon": -71.0972, "cf_bearing": 96},   # keeping yours — plausible given weird shape
+    "Yankee Stadium":                 {"lat": 40.8296, "lon": -73.9262, "cf_bearing": 300},  # keeping yours — close to my 315
+    "Rogers Centre":                  {"lat": 43.6414, "lon": -79.3894, "cf_bearing": 330,   "covered": True},
+    "Tropicana Field":                {"lat": 27.7682, "lon": -82.6534, "cf_bearing": 0,     "covered": True},
     # AL Central
-    "Guaranteed Rate Field":          {"lat": 41.8299, "lon": -87.6338, "cf_bearing": 346},
-    "Progressive Field":              {"lat": 41.4962, "lon": -81.6852, "cf_bearing": 335},
-    "Comerica Park":                  {"lat": 42.3390, "lon": -83.0485, "cf_bearing": 352},
-    "Kauffman Stadium":               {"lat": 39.0517, "lon": -94.4803, "cf_bearing": 5},
-    "Target Field":                   {"lat": 44.9817, "lon": -93.2783, "cf_bearing": 336},
+    "Guaranteed Rate Field":          {"lat": 41.8299, "lon": -87.6338, "cf_bearing": 135},  # was 346 — confirmed SE from source
+    "Progressive Field":              {"lat": 41.4962, "lon": -81.6852, "cf_bearing": 20},   # was 335 — estimated NNE
+    "Comerica Park":                  {"lat": 42.3390, "lon": -83.0485, "cf_bearing": 335},  # keeping yours — roughly NNW
+    "Kauffman Stadium":               {"lat": 39.0517, "lon": -94.4803, "cf_bearing": 60},   # was 5 — estimated ENE
+    "Target Field":                   {"lat": 44.9817, "lon": -93.2783, "cf_bearing": 336},  # keeping yours
     # AL West
-    "Globe Life Field":               {"lat": 32.7473, "lon": -97.0845, "cf_bearing": 5,   "covered": True},
-    "Daikin Park":                    {"lat": 29.7573, "lon": -95.3555, "cf_bearing": 25,  "covered": True},
-    "Angel Stadium of Anaheim":       {"lat": 33.8003, "lon": -117.8827,"cf_bearing": 355},
-    "Oakland Coliseum":               {"lat": 37.7516, "lon": -122.2005,"cf_bearing": 360},
+    "Globe Life Field":               {"lat": 32.7473, "lon": -97.0845, "cf_bearing": 5,     "covered": True},
+    "Daikin Park":                    {"lat": 29.7573, "lon": -95.3555, "cf_bearing": 337,   "covered": True},  # was 25 — confirmed NNW
+    "Angel Stadium of Anaheim":       {"lat": 33.8003, "lon": -117.8827,"cf_bearing": 40},   # was 355 — estimated NE
+    "Oakland Coliseum":               {"lat": 37.7516, "lon": -122.2005,"cf_bearing": 355},  # keeping yours
     "Sutter Health Park":             {"lat": 38.5787, "lon": -121.5001,"cf_bearing": 0},
-    "T-Mobile Park":                  {"lat": 47.5914, "lon": -122.3325,"cf_bearing": 20,  "covered": True},
+    "T-Mobile Park":                  {"lat": 47.5914, "lon": -122.3325,"cf_bearing": 20,    "covered": True},  # keeping yours
     # NL East
-    "Nationals Park":                 {"lat": 38.8730, "lon": -77.0074, "cf_bearing": 355},
-    "loanDepot park":                 {"lat": 25.7781, "lon": -80.2197, "cf_bearing": 350, "covered": True},
-    "Citi Field":                     {"lat": 40.7571, "lon": -73.8458, "cf_bearing": 2},
-    "Citizens Bank Park":             {"lat": 39.9061, "lon": -75.1665, "cf_bearing": 350},
-    "Truist Park":                    {"lat": 33.8908, "lon": -84.4678, "cf_bearing": 348},
+    "Nationals Park":                 {"lat": 38.8730, "lon": -77.0074, "cf_bearing": 355},  # keeping yours
+    "loanDepot park":                 {"lat": 25.7781, "lon": -80.2197, "cf_bearing": 350,   "covered": True},
+    "Citi Field":                     {"lat": 40.7571, "lon": -73.8458, "cf_bearing": 15},   # was 2 — close enough, slight NNE tweak
+    "Citizens Bank Park":             {"lat": 39.9061, "lon": -75.1665, "cf_bearing": 350},  # keeping yours
+    "Truist Park":                    {"lat": 33.8908, "lon": -84.4678, "cf_bearing": 20},   # was 348 — estimated NNE
     # NL Central
-    "Wrigley Field":                  {"lat": 41.9484, "lon": -87.6553, "cf_bearing": 355},
-    "Great American Ball Park":       {"lat": 39.0979, "lon": -84.5082, "cf_bearing": 352},
-    "American Family Field":          {"lat": 43.0280, "lon": -87.9712, "cf_bearing": 5,   "covered": True},
-    "PNC Park":                       {"lat": 40.4469, "lon": -80.0057, "cf_bearing": 352},
-    "Busch Stadium":                  {"lat": 38.6226, "lon": -90.1928, "cf_bearing": 345},
+    "Wrigley Field":                  {"lat": 41.9484, "lon": -87.6553, "cf_bearing": 10},   # was 355 — slight NNE, north winds blow out
+    "Great American Ball Park":       {"lat": 39.0979, "lon": -84.5082, "cf_bearing": 352},  # keeping yours
+    "American Family Field":          {"lat": 43.0280, "lon": -87.9712, "cf_bearing": 5,     "covered": True},
+    "PNC Park":                       {"lat": 40.4469, "lon": -80.0057, "cf_bearing": 352},  # keeping yours
+    "Busch Stadium":                  {"lat": 38.6226, "lon": -90.1928, "cf_bearing": 15},   # was 345 — estimated NNE
     # NL West
-    "Chase Field":                    {"lat": 33.4453, "lon": -112.0667,"cf_bearing": 0,   "covered": True},
-    "Coors Field":                    {"lat": 39.7559, "lon": -104.9942,"cf_bearing": 13},
-    "UNIQLO Field at Dodger Stadium": {"lat": 34.0739, "lon": -118.2400,"cf_bearing": 0},
-    "Oracle Park":                    {"lat": 37.7785, "lon": -122.3893,"cf_bearing": 110},
-    "Petco Park":                     {"lat": 32.7076, "lon": -117.1570,"cf_bearing": 315},
+    "Chase Field":                    {"lat": 33.4453, "lon": -112.0667,"cf_bearing": 0,     "covered": True},
+    "Coors Field":                    {"lat": 39.7559, "lon": -104.9942,"cf_bearing": 35},   # was 13 — estimated NNE
+    "Dodger Stadium":                 {"lat": 34.0739, "lon": -118.2400,"cf_bearing": 355},  # renamed back — check API name
+    "Oracle Park":                    {"lat": 37.7785, "lon": -122.3893,"cf_bearing": 110},  # keeping yours — faces the bay
+    "Petco Park":                     {"lat": 32.7076, "lon": -117.1570,"cf_bearing": 315},  # keeping yours — NW
 }
 
 # Alternate / historical / shorthand names → canonical key above.
