@@ -111,7 +111,7 @@ jobs:
         run: |
           # Handle both scheduled runs (no inputs) and manual triggers
           DATE="${{ github.event.inputs.date || inputs.date || 'today' }}"
-          TOP_N="${{ github.event.inputs.top_n || inputs.top_n || '10' }}"
+          TOP_N="${{ github.event.inputs.top_n || inputs.top_n || '35' }}"
           DRY_RUN="${{ github.event.inputs.dry_run || inputs.dry_run || 'false' }}"
           echo "date=${DATE}" >> $GITHUB_OUTPUT
           echo "top_n=${TOP_N}" >> $GITHUB_OUTPUT
