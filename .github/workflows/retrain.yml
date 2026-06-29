@@ -30,9 +30,9 @@ on:
   workflow_dispatch:
     inputs:
       years:
-        description: "Training years (comma-separated, e.g. 2022,2023,2024,2025)"
+        description: "Training years (comma-separated, e.g. 2022,2023,2024,2025,2026)"
         required: false
-        default: "2022,2023,2024,2025"
+        default: "2022,2023,2024,2025,2026"
         type: string
       dry_run:
         description: "Train but don't commit model to repo"
@@ -79,7 +79,7 @@ jobs:
 
       - name: Train model
         run: |
-          YEARS="${{ github.event.inputs.years || '2022,2023,2024,2025' }}"
+          YEARS="${{ github.event.inputs.years || '2022,2023,2024,2025,2026' }}"
           python - << EOF
           import logging, sys
           logging.basicConfig(
@@ -138,7 +138,7 @@ jobs:
           ")
             git commit -m "chore: retrain HR model [${METRICS}]
 
-          Training years: ${{ github.event.inputs.years || '2022,2023,2024,2025' }}
+          Training years: ${{ github.event.inputs.years || '2022,2023,2024,2025,2026' }}
           Run: ${{ github.run_id }}"
             git push
             echo "✅ Model committed and pushed."
