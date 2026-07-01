@@ -278,3 +278,139 @@ def park_factor(venue: str, config: dict) -> float:  # type: ignore[no-redef]
 
     log.debug("Park factor not found for %r, using default %.2f", venue, default)
     return default
+
+
+# ===========================================================================
+# Additional rate functions for TB, H, R, RBI
+# ===========================================================================
+
+LG_TB_PER_PA    = 0.358
+LG_H_PER_PA     = 0.216
+LG_R_PER_GAME   = 0.490
+LG_RBI_PER_GAME = 0.490
+LG_ERA          = 4.20
+
+
+def _tb_from_stats_dict(s: dict) -> float:
+    """Compute total bases from counting stats dict."""
+    hits  = _safe(s.get("hits", 0))
+    d     = _safe(s.get("doubles", 0))
+    t     = _safe(s.get("triples", 0))
+    hr    = _safe(s.get("homeRuns", 0))
+    # TB = 1B + 2×2B + 3×3B + 4×HR = hits + doubles + 2×triples + 3×HRs
+    return hits + d + 2 * t + 3 * hr
+
+
+def tb_rate_from_stats(season: dict, career: dict) -> tuple[float, int]:
+    """Blended TB/PA rate."""
+    s_tb = _tb_from_stats_dict(season)
+    s_pa = _safe(season.get("plateAppearances", 0))
+    c_tb = _tb_from_stats_dict(career)
+    c_pa = _safe(career.get("plateAppearances", 0))
+
+    s_rate = s_tb / s_pa if s_pa > 0 else LG_TB_PER_PA
+    c_rate = c_tb / c_pa if c_pa > 0 else LG_TB_PER_PA
+
+    blended = bayesian_blend(
+        season_rate=s_rate, season_n=int(s_pa),
+        career_rate=c_rate, career_n=int(c_pa),
+        prior=LG_TB_PER_PA, prior_weight=400,
+    )
+    return float(np.clip(blended, 0.0, 1.5)), int(s_pa)
+
+
+def h_rate_from_stats(season: dict, career: dict) -> float:
+    """Blended H/PA rate."""
+    s_h  = _safe(season.get("hits", 0))
+    s_pa = _safe(season.get("plateAppearances", 0))
+    c_h  = _safe(career.get("hits", 0))
+    c_pa = _safe(career.get("plateAppearances", 0))
+
+    s_rate = s_h / s_pa if s_pa > 0 else LG_H_PER_PA
+    c_rate = c_h / c_pa if c_pa > 0 else LG_H_PER_PA
+
+    return float(np.clip(bayesian_blend(
+        season_rate=s_rate, season_n=int(s_pa),
+        career_rate=c_rate, career_n=int(c_pa),
+        prior=LG_H_PER_PA, prior_weight=400,
+    ), 0.0, 0.6))
+
+
+def r_rate_from_stats(season: dict, career: dict) -> float:
+    """Blended R/game rate."""
+    s_r  = _safe(season.get("runs", 0))
+    s_gp = _safe(season.get("gamesPlayed", 1))
+    c_r  = _safe(career.get("runs", 0))
+    c_gp = _safe(career.get("gamesPlayed", 1))
+
+    s_rate = s_r / s_gp if s_gp > 0 else LG_R_PER_GAME
+    c_rate = c_r / c_gp if c_gp > 0 else LG_R_PER_GAME
+
+    return float(np.clip(bayesian_blend(
+        season_rate=s_rate, season_n=int(s_gp) * 4,
+        career_rate=c_rate, career_n=int(c_gp) * 4,
+        prior=LG_R_PER_GAME, prior_weight=300,
+    ), 0.0, 2.0))
+
+
+def rbi_rate_from_stats(season: dict, career: dict) -> float:
+    """Blended RBI/game rate."""
+    s_rbi = _safe(season.get("rbi", 0))
+    s_gp  = _safe(season.get("gamesPlayed", 1))
+    c_rbi = _safe(career.get("rbi", 0))
+    c_gp  = _safe(career.get("gamesPlayed", 1))
+
+    s_rate = s_rbi / s_gp if s_gp > 0 else LG_RBI_PER_GAME
+    c_rate = c_rbi / c_gp if c_gp > 0 else LG_RBI_PER_GAME
+
+    return float(np.clip(bayesian_blend(
+        season_rate=s_rate, season_n=int(s_gp) * 4,
+        career_rate=c_rate, career_n=int(c_gp) * 4,
+        prior=LG_RBI_PER_GAME, prior_weight=300,
+    ), 0.0, 2.0))
+
+
+def pitcher_hit_factor(p_season: dict, p_career: dict) -> float:
+    """
+    Multiplicative factor for how hit-prone this pitcher is.
+    1.0 = league average. >1.0 = more hits/TB/RBI allowed.
+    Uses ERA relative to league average as a broad quality proxy.
+    """
+    s_era = _safe(p_season.get("era", LG_ERA))
+    s_ip  = _safe(p_season.get("inningsPitched", 0))
+    c_era = _safe(p_career.get("era", LG_ERA))
+    c_ip  = _safe(p_career.get("inningsPitched", 0))
+
+    if s_ip < 5:
+        blended_era = c_era if c_ip > 30 else LG_ERA
+    else:
+        w = min(s_ip / (s_ip + 150), 0.7)
+        blended_era = w * s_era + (1 - w) * (c_era if c_ip > 30 else LG_ERA)
+
+    factor = blended_era / LG_ERA
+    return float(np.clip(factor, 0.6, 1.6))
+
+
+def expected_tb_tonight(
+    tb_rate: float, est_pa: float,
+    pf: float, wf: float, pitcher_hit_f: float, recent_f: float,
+) -> float:
+    """Expected total bases in tonight's game."""
+    return float(np.clip(
+        tb_rate * est_pa * pf * wf * pitcher_hit_f * recent_f,
+        0.0, 8.0,
+    ))
+
+
+def expected_hrbi_tonight(
+    h_rate: float, r_rate: float, rbi_rate: float,
+    est_pa: float, pitcher_hit_f: float, home_f: float, recent_f: float,
+) -> tuple[float, float, float]:
+    """
+    Expected H, R, RBI tonight. Returns (exp_h, exp_r, exp_rbi).
+    Runs depend partly on lineup context so we apply a softer adjustment.
+    """
+    exp_h   = float(np.clip(h_rate * est_pa * pitcher_hit_f * recent_f, 0, 4.0))
+    exp_r   = float(np.clip(r_rate * home_f * recent_f, 0, 3.0))
+    exp_rbi = float(np.clip(rbi_rate * pitcher_hit_f * recent_f, 0, 3.0))
+    return exp_h, exp_r, exp_rbi

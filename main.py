@@ -76,7 +76,9 @@ def load_config(path: str = "config.yml") -> dict:
     with open(path) as f:
         cfg = yaml.safe_load(f)
     if os.environ.get("TOP_N"):
-        cfg.setdefault("prediction", {})["top_n"] = int(os.environ["TOP_N"])
+        n = int(os.environ["TOP_N"])
+        for key in ("top_n", "top_n_hr", "top_n_tb", "top_n_hrbi", "top_n_rbi"):
+            cfg.setdefault("prediction", {})[key] = n
     if os.environ.get("PREDICT_DATE"):
         cfg.setdefault("prediction", {})["date"] = os.environ["PREDICT_DATE"]
     return cfg
@@ -298,7 +300,11 @@ def run(config: dict, dry_run: bool = False) -> list[dict]:
     # ── Date ──────────────────────────────────────────────────────────────
     game_date = resolve_game_date(pred_cfg.get("date", "today"), fn)
     season    = game_date.year
-    top_n     = int(pred_cfg.get("top_n", 10))
+    top_n     = int(pred_cfg.get("top_n", 10))   # legacy fallback
+    top_n_hr   = int(pred_cfg.get("top_n_hr",   top_n))
+    top_n_tb   = int(pred_cfg.get("top_n_tb",   top_n))
+    top_n_hrbi = int(pred_cfg.get("top_n_hrbi", top_n))
+    top_n_rbi  = int(pred_cfg.get("top_n_rbi",  top_n))
     min_pa    = int(pred_cfg.get("min_pa_season", 30))
     min_games = int(pred_cfg.get("min_games_played", 10))
     recent_n  = int(model_cfg.get("recent_form_games", 15))
@@ -393,28 +399,49 @@ def run(config: dict, dry_run: bool = False) -> list[dict]:
                 except Exception as exc:
                     log.warning("Prediction failed player %d: %s", player_id, exc)
 
-    all_predictions.sort(key=lambda x: x["hr_probability"], reverse=True)
-    top_predictions = all_predictions[:top_n]
+    # Sort into four independent ranked lists
+    hr_preds   = sorted(all_predictions, key=lambda x: x["hr_probability"],       reverse=True)[:top_n_hr]
+    tb_preds   = sorted(all_predictions, key=lambda x: x.get("expected_tb",   0), reverse=True)[:top_n_tb]
+    hrbi_preds = sorted(all_predictions, key=lambda x: x.get("expected_hrbi", 0), reverse=True)[:top_n_hrbi]
+    rbi_preds  = sorted(all_predictions, key=lambda x: x.get("expected_rbi",  0), reverse=True)[:top_n_rbi]
 
-    log.info("Top %d from %d candidates:", top_n, len(all_predictions))
-    for i, p in enumerate(top_predictions, 1):
-        log.info(
-            "  %2d. %-25s %s  conf=%s  src=%s",
-            i, p["player_name"], p["hr_pct"],
-            p["confidence_tier"], p.get("rate_source", "?"),
-        )
+    log.info("HR %d | TB %d | H+R+RBI %d | RBI %d (from %d candidates)",
+             len(hr_preds), len(tb_preds), len(hrbi_preds), len(rbi_preds), len(all_predictions))
+
+    log.info("── 💥 HR ──")
+    for i, p in enumerate(hr_preds, 1):
+        log.info("  %2d. %-24s hr=%-6s tb=%-4s hrbi=%-4s rbi=%s",
+                 i, p["player_name"], p["hr_pct"],
+                 p.get("expected_tb","?"), p.get("expected_hrbi","?"), p.get("expected_rbi","?"))
+
+    log.info("── 📊 Total Bases ──")
+    for i, p in enumerate(tb_preds, 1):
+        log.info("  %2d. %-24s tb=%-4s hr=%s",
+                 i, p["player_name"], p.get("expected_tb","?"), p["hr_pct"])
+
+    log.info("── ⭐ H+R+RBI ──")
+    for i, p in enumerate(hrbi_preds, 1):
+        log.info("  %2d. %-24s hrbi=%-4s h=%-4s r=%-4s rbi=%s",
+                 i, p["player_name"], p.get("expected_hrbi","?"),
+                 p.get("expected_h","?"), p.get("expected_r","?"), p.get("expected_rbi_hrbi","?"))
+
+    log.info("── 🎯 RBI ──")
+    for i, p in enumerate(rbi_preds, 1):
+        log.info("  %2d. %-24s rbi=%-4s hrbi=%s",
+                 i, p["player_name"], p.get("expected_rbi","?"), p.get("expected_hrbi","?"))
 
     # ── Email ─────────────────────────────────────────────────────────────
     if not dry_run:
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
         sent = fn["send_email"](
-            predictions=top_predictions,
-            prediction_date=game_date.strftime("%A, %B %-d, %Y"),
-            games_today=len(matchups),
+            hr_preds=hr_preds, tb_preds=tb_preds,
+            hrbi_preds=hrbi_preds, rbi_preds=rbi_preds,
+            date_str=game_date.strftime("%A, %B %-d, %Y"),
+            games=len(matchups),
             lineups_confirmed=lineups_confirmed,
-            generated_at=now_utc,
+            ts=now_utc,
             subject_template=config.get("email", {}).get(
-                "subject", "⚾ Top {n} HR Predictions — {date}"
+                "subject", "⚾ MLB Predictions — {date}"
             ),
         )
         if sent:
@@ -425,7 +452,7 @@ def run(config: dict, dry_run: bool = False) -> list[dict]:
     else:
         log.info("Dry run — email not sent.")
 
-    return top_predictions
+    return {"hr": hr_preds, "tb": tb_preds, "hrbi": hrbi_preds, "rbi": rbi_preds}
 
 
 # ---------------------------------------------------------------------------
@@ -449,7 +476,8 @@ if __name__ == "__main__":
     if args.date:
         config.setdefault("prediction", {})["date"] = args.date
     if args.top_n:
-        config.setdefault("prediction", {})["top_n"] = args.top_n
+        for key in ("top_n", "top_n_hr", "top_n_tb", "top_n_hrbi", "top_n_rbi"):
+            config.setdefault("prediction", {})[key] = args.top_n
     if args.retrain:
         from src.models.train import train
         train()

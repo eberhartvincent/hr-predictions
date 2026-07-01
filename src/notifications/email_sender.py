@@ -1,325 +1,353 @@
 """
 email_sender.py
 ===============
-Sends the daily HR prediction report via SMTP (Gmail-compatible).
-
-Required environment variables:
-    EMAIL_SENDER      — from address (e.g. mybot@gmail.com)
-    EMAIL_PASSWORD    — SMTP password / Gmail App Password
-    EMAIL_RECIPIENTS  — comma-separated list of recipient addresses
-    EMAIL_HOST        — (optional) SMTP host, default smtp.gmail.com
-    EMAIL_PORT        — (optional) SMTP port, default 587
-
-Note on templating
-------------------
-The HTML template uses str.replace() rather than str.format() so that
-CSS curly braces (e.g. {box-sizing:border-box}) are never misread as
-Python format placeholders.
+Four-section email: HR · Total Bases · H+R+RBI · RBI
+Each section independently ranked.
+Uses %%PLACEHOLDER%% templating to avoid CSS curly-brace conflicts.
 """
 from __future__ import annotations
-
-import logging
-import os
-import smtplib
+import logging, os, smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# HTML template — placeholders use %%NAME%% to avoid any conflict with CSS
-# ---------------------------------------------------------------------------
-_HTML_TEMPLATE = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>HR Predictions</title>
+_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{background:#0d1117;color:#e6edf3;font-family:'Syne',sans-serif;padding:0}
-  .wrapper{max-width:680px;margin:0 auto;background:#0d1117}
-  .header{background:linear-gradient(135deg,#1a2332 0%,#0f1923 60%,#162032 100%);
-          padding:36px 32px 28px;border-bottom:2px solid #21a96a}
-  .header-top{display:flex;align-items:center;gap:12px;margin-bottom:6px}
-  .logo{font-size:28px}
-  .brand{font-size:13px;font-weight:600;letter-spacing:3px;text-transform:uppercase;color:#21a96a}
-  .title{font-size:30px;font-weight:800;color:#ffffff;line-height:1.15;margin-bottom:4px}
-  .subtitle{font-size:13px;color:#7d8590;font-family:'JetBrains Mono',monospace}
-  .date-badge{display:inline-block;background:#21a96a18;border:1px solid #21a96a44;
-              color:#21a96a;font-family:'JetBrains Mono',monospace;font-size:12px;
-              padding:4px 12px;border-radius:20px;margin-top:10px}
-  .summary{background:#161b22;padding:16px 32px;display:flex;gap:32px;
-           border-bottom:1px solid #21262d}
-  .stat-item{display:flex;flex-direction:column;gap:2px}
-  .stat-label{font-size:10px;letter-spacing:2px;text-transform:uppercase;color:#7d8590}
-  .stat-value{font-size:18px;font-weight:700;color:#e6edf3}
-  .section-header{padding:20px 32px 12px;border-bottom:1px solid #21262d}
-  .section-title{font-size:11px;font-weight:600;letter-spacing:3px;text-transform:uppercase;
-                 color:#21a96a;margin-bottom:2px}
-  .predictions{padding:0 32px}
-  .player-card{border-bottom:1px solid #21262d1a;padding:20px 0;position:relative}
-  .player-card:last-child{border-bottom:none}
-  .card-top{display:flex;align-items:flex-start;gap:16px}
-  .rank{width:36px;height:36px;border-radius:8px;display:flex;align-items:center;
-        justify-content:center;font-size:13px;font-weight:800;flex-shrink:0;
-        font-family:'JetBrains Mono',monospace}
-  .rank-1{background:#f1c40f22;color:#f1c40f;border:1px solid #f1c40f44}
-  .rank-2{background:#95a5a622;color:#bdc3c7;border:1px solid #95a5a644}
-  .rank-3{background:#e67e2222;color:#e67e22;border:1px solid #e67e2244}
-  .rank-other{background:#21262d;color:#7d8590;border:1px solid #30363d}
-  .player-info{flex:1;min-width:0}
-  .player-name{font-size:17px;font-weight:700;color:#e6edf3;margin-bottom:2px}
-  .player-meta{font-size:12px;color:#7d8590;font-family:'JetBrains Mono',monospace}
-  .prob-block{text-align:right;flex-shrink:0}
-  .prob-pct{font-size:26px;font-weight:800;line-height:1;color:#21a96a}
-  .prob-label{font-size:10px;color:#7d8590;letter-spacing:1px;text-transform:uppercase;margin-top:2px}
-  .prob-bar-wrap{margin:10px 0 8px;height:4px;background:#21262d;border-radius:2px;overflow:hidden}
-  .prob-bar{height:100%;border-radius:2px;background:linear-gradient(90deg,#21a96a,#3dd68c)}
-  .factors{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
-  .chip{font-family:'JetBrains Mono',monospace;font-size:10px;padding:3px 8px;
-        border-radius:4px;display:inline-flex;align-items:center;gap:4px}
-  .chip-park{background:#1d3a5c;color:#58a6ff;border:1px solid #1f6feb44}
-  .chip-wind{background:#0d2818;color:#3fb950;border:1px solid #21a96a44}
-  .chip-wind-bad{background:#3d1515;color:#f85149;border:1px solid #da363144}
-  .chip-platoon{background:#2d1b4e;color:#d2a8ff;border:1px solid #8957e544}
-  .chip-barrel{background:#3d2b00;color:#e3b341;border:1px solid #d2941344}
-  .chip-ev{background:#1e2a1e;color:#56d364;border:1px solid #2ea04344}
-  .chip-confidence-High{background:#0d2818;color:#3fb950;border:1px solid #2ea04344}
-  .chip-confidence-Medium{background:#2d2200;color:#e3b341;border:1px solid #d2941344}
-  .chip-confidence-Low{background:#3d1515;color:#f0883e;border:1px solid #e3631a44}
-  .matchup{font-size:11px;color:#8b949e;font-family:'JetBrains Mono',monospace;
-           margin-top:6px;padding:6px 10px;background:#161b22;border-radius:6px;
-           border-left:2px solid #30363d}
-  .matchup strong{color:#e6edf3}
-  .footer{padding:28px 32px;border-top:1px solid #21262d;background:#0d1117}
-  .footer-note{font-size:11px;color:#484f58;line-height:1.7;font-family:'JetBrains Mono',monospace}
-  .footer-divider{height:1px;background:linear-gradient(90deg,transparent,#21a96a44,transparent);margin:16px 0}
-  .method-title{font-size:10px;font-weight:600;letter-spacing:2px;text-transform:uppercase;
-                color:#21a96a;margin-bottom:8px}
-  .method-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px 24px}
-  .method-item{font-size:10px;color:#484f58;font-family:'JetBrains Mono',monospace}
-  .method-item span{color:#7d8590}
-</style>
-</head>
-<body>
-<div class="wrapper">
-  <div class="header">
-    <div class="header-top"><span class="logo">⚾</span><span class="brand">MLB Analytics</span></div>
-    <div class="title">Home Run<br>Predictions</div>
-    <div class="subtitle">Powered by Statcast · Log5 · Weather · Park Factors</div>
-    <div class="date-badge">📅 %%PREDICTION_DATE%%</div>
-  </div>
-  <div class="summary">
-    <div class="stat-item"><span class="stat-label">Players Ranked</span><span class="stat-value">%%TOP_N%%</span></div>
-    <div class="stat-item"><span class="stat-label">Games Today</span><span class="stat-value">%%GAMES_TODAY%%</span></div>
-    <div class="stat-item"><span class="stat-label">Avg Probability</span><span class="stat-value">%%AVG_PROB%%%</span></div>
-    <div class="stat-item"><span class="stat-label">Lineups Locked</span><span class="stat-value">%%LINEUPS_CONFIRMED%%</span></div>
-  </div>
-  <div class="section-header"><div class="section-title">Today's Top Picks</div></div>
-  <div class="predictions">
-%%PLAYER_CARDS%%
-  </div>
-  <div class="footer">
-    <div class="method-title">Methodology</div>
-    <div class="method-grid">
-      <div class="method-item">🎯 <span>Barrel Rate (Statcast)</span></div>
-      <div class="method-item">💨 <span>Exit Velocity</span></div>
-      <div class="method-item">⚾ <span>Log5 Matchup (HR/PA)</span></div>
-      <div class="method-item">🏟️ <span>Park HR Factors</span></div>
-      <div class="method-item">🌤️ <span>Live Weather + Wind</span></div>
-      <div class="method-item">🤝 <span>Platoon Splits</span></div>
-      <div class="method-item">📈 <span>Recent Form (15G)</span></div>
-      <div class="method-item">📊 <span>XGBoost + Bayesian Blend</span></div>
-    </div>
-    <div class="footer-divider"></div>
-    <div class="footer-note">
-      Probabilities reflect P(≥1 HR) estimated via Poisson distribution.<br>
-      Statcast data © Baseball Savant · Weather © OpenWeatherMap<br>
-      <strong>For informational purposes only.</strong> Generated at %%GENERATED_AT%% UTC.
-    </div>
-  </div>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',sans-serif}
+.wrapper{max-width:680px;margin:0 auto}
+.header{background:linear-gradient(135deg,#0f1f2e,#0d1117);padding:32px;border-bottom:2px solid #21a96a}
+.brand{font-size:11px;font-weight:600;letter-spacing:3px;text-transform:uppercase;color:#21a96a}
+.title{font-size:28px;font-weight:800;color:#fff;margin:4px 0}
+.sub{font-size:12px;color:#7d8590;font-family:monospace}
+.badge{display:inline-block;background:#21a96a14;border:1px solid #21a96a44;color:#21a96a;
+       font-family:monospace;font-size:11px;padding:3px 10px;border-radius:20px;margin-top:8px}
+.summary{background:#161b22;padding:14px 32px;display:flex;gap:24px;flex-wrap:wrap;
+         border-bottom:1px solid #21262d}
+.si{display:flex;flex-direction:column;gap:2px}
+.sl{font-size:10px;letter-spacing:2px;text-transform:uppercase;color:#7d8590}
+.sv{font-size:16px;font-weight:700;color:#e6edf3}
+/* Section headers */
+.sec-hr   {padding:18px 32px 10px;border-bottom:1px solid #21262d;border-top:3px solid #21a96a;margin-top:4px}
+.sec-tb   {padding:18px 32px 10px;border-bottom:1px solid #21262d;border-top:3px solid #4493f8;margin-top:4px}
+.sec-hrbi {padding:18px 32px 10px;border-bottom:1px solid #21262d;border-top:3px solid #d2a8ff;margin-top:4px}
+.sec-rbi  {padding:18px 32px 10px;border-bottom:1px solid #21262d;border-top:3px solid #e3b341;margin-top:4px}
+.t-hr   {font-size:14px;font-weight:700;color:#21a96a;margin-bottom:2px}
+.t-tb   {font-size:14px;font-weight:700;color:#4493f8;margin-bottom:2px}
+.t-hrbi {font-size:14px;font-weight:700;color:#d2a8ff;margin-bottom:2px}
+.t-rbi  {font-size:14px;font-weight:700;color:#e3b341;margin-bottom:2px}
+.sec-sub{font-size:11px;color:#7d8590;font-family:monospace}
+.preds{padding:0 32px}
+/* Cards */
+.card{border-bottom:1px solid #1a2030;padding:16px 0}
+.card:last-child{border-bottom:none}
+.ct{display:flex;align-items:flex-start;gap:14px}
+.rk{width:32px;height:32px;border-radius:7px;display:flex;align-items:center;justify-content:center;
+    font-size:12px;font-weight:800;flex-shrink:0;font-family:monospace}
+.r1-hr  {background:#21a96a22;color:#21a96a;border:1px solid #21a96a44}
+.r2-hr  {background:#21a96a14;color:#3dd68c;border:1px solid #21a96a30}
+.r3-hr  {background:#0d2818;color:#3dd68c;border:1px solid #21a96a20}
+.r1-tb  {background:#4493f822;color:#4493f8;border:1px solid #4493f844}
+.r2-tb  {background:#4493f814;color:#79c0ff;border:1px solid #4493f830}
+.r3-tb  {background:#1d3a5c;color:#79c0ff;border:1px solid #4493f820}
+.r1-hrbi{background:#d2a8ff22;color:#d2a8ff;border:1px solid #d2a8ff44}
+.r2-hrbi{background:#d2a8ff14;color:#c4a0f8;border:1px solid #d2a8ff30}
+.r3-hrbi{background:#2d1b4e;color:#c4a0f8;border:1px solid #d2a8ff20}
+.r1-rbi {background:#e3b34122;color:#e3b341;border:1px solid #e3b34144}
+.r2-rbi {background:#e3b34114;color:#d29922;border:1px solid #e3b34130}
+.r3-rbi {background:#3d2b00;color:#d29922;border:1px solid #e3b34120}
+.ro{background:#21262d;color:#7d8590;border:1px solid #30363d}
+.pi{flex:1;min-width:0}
+.pn{font-size:15px;font-weight:700;color:#e6edf3;margin-bottom:1px}
+.pm{font-size:11px;color:#7d8590;font-family:monospace}
+.mu{font-size:11px;color:#8b949e;margin-top:4px;padding:4px 8px;background:#161b22;
+    border-radius:5px;border-left:2px solid #30363d;font-family:monospace}
+.mu strong{color:#e6edf3}
+.bar-w{margin:7px 0 5px;height:3px;background:#21262d;border-radius:2px;overflow:hidden}
+.bar-hr  {height:100%;border-radius:2px;background:linear-gradient(90deg,#21a96a,#3dd68c)}
+.bar-tb  {height:100%;border-radius:2px;background:linear-gradient(90deg,#4493f8,#79c0ff)}
+.bar-hrbi{height:100%;border-radius:2px;background:linear-gradient(90deg,#8957e5,#d2a8ff)}
+.bar-rbi {height:100%;border-radius:2px;background:linear-gradient(90deg,#e3b341,#f0c060)}
+.chips{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}
+.chip{font-family:monospace;font-size:10px;padding:2px 6px;border-radius:4px;display:inline-flex;align-items:center;gap:3px}
+.c-b{background:#1d3a5c;color:#58a6ff;border:1px solid #1f6feb33}
+.c-g{background:#0d2818;color:#3fb950;border:1px solid #2ea04333}
+.c-r{background:#3d1515;color:#f85149;border:1px solid #da363133}
+.c-a{background:#3d2b00;color:#e3b341;border:1px solid #d2941333}
+.c-p{background:#2d1b4e;color:#d2a8ff;border:1px solid #8957e533}
+.c-hi {background:#0d2818;color:#3fb950;border:1px solid #2ea04333}
+.c-med{background:#2d2200;color:#e3b341;border:1px solid #d2941333}
+.c-low{background:#3d1515;color:#f0883e;border:1px solid #e3631a33}
+.pb{text-align:right;flex-shrink:0;min-width:64px}
+.v-hr  {font-size:22px;font-weight:800;line-height:1;color:#21a96a}
+.v-tb  {font-size:22px;font-weight:800;line-height:1;color:#4493f8}
+.v-hrbi{font-size:22px;font-weight:800;line-height:1;color:#d2a8ff}
+.v-rbi {font-size:22px;font-weight:800;line-height:1;color:#e3b341}
+.pl{font-size:9px;color:#7d8590;letter-spacing:1px;text-transform:uppercase;margin-top:2px}
+/* Footer */
+.footer{padding:24px 32px;border-top:1px solid #21262d}
+.fn{font-size:11px;color:#484f58;line-height:1.7;font-family:monospace}
+.fd{height:1px;background:linear-gradient(90deg,transparent,#21a96a44,transparent);margin:12px 0}
+.mg{display:grid;grid-template-columns:1fr 1fr;gap:3px 20px}
+.mi{font-size:10px;color:#484f58;font-family:monospace}
+.mi span{color:#7d8590}
+.mt{font-size:10px;font-weight:600;letter-spacing:2px;text-transform:uppercase;color:#21a96a;margin-bottom:6px}
+</style></head><body><div class="wrapper">
+<div class="header">
+  <div class="brand">MLB Analytics</div>
+  <div class="title">Daily Batter<br>Predictions</div>
+  <div class="sub">HR · Total Bases · H+R+RBI · RBI · Statcast · Log5</div>
+  <div class="badge">⚾ %%DATE%%</div>
 </div>
-</body>
-</html>"""
+<div class="summary">
+  <div class="si"><span class="sl">Games</span><span class="sv">%%GAMES%%</span></div>
+  <div class="si"><span class="sl">Players</span><span class="sv">%%PLAYERS%%</span></div>
+  <div class="si"><span class="sl">Avg HR Prob</span><span class="sv">%%AVGHR%%%</span></div>
+  <div class="si"><span class="sl">Lineups</span><span class="sv">%%LINEUPS%%</span></div>
+</div>
 
-# Card template — same %%NAME%% convention
-_CARD_TEMPLATE = """    <div class="player-card">
-      <div class="card-top">
-        <div class="rank rank-%%RANK_CLASS%%">%%RANK%%</div>
-        <div class="player-info">
-          <div class="player-name">%%PLAYER_NAME%%</div>
-          <div class="player-meta">%%TEAM%% · %%POSITION%% · Bats %%BATS%%</div>
-          <div class="matchup">vs <strong>%%PITCHER_NAME%%</strong> (%%PITCHER_HAND%%HP) · %%VENUE%%</div>
-          <div class="prob-bar-wrap"><div class="prob-bar" style="width:%%BAR_PCT%%%;"></div></div>
-          <div class="factors">%%CHIPS%%</div>
-        </div>
-        <div class="prob-block">
-          <div class="prob-pct">%%HR_PCT%%</div>
-          <div class="prob-label">HR Prob</div>
-        </div>
-      </div>
-    </div>"""
+<div class="sec-hr">
+  <div class="t-hr">💥 Top %%N_HR%% — Home Run Probability</div>
+  <div class="sec-sub">P(HR ≥ 1) · Statcast barrel rate · Log5 matchup · Park + weather</div>
+</div>
+<div class="preds">%%HR_CARDS%%</div>
+
+<div class="sec-tb">
+  <div class="t-tb">📊 Top %%N_TB%% — Total Bases</div>
+  <div class="sec-sub">Expected TB tonight · SLG-based rate · Pitcher hit factor</div>
+</div>
+<div class="preds">%%TB_CARDS%%</div>
+
+<div class="sec-hrbi">
+  <div class="t-hrbi">⭐ Top %%N_HRBI%% — H + R + RBI</div>
+  <div class="sec-sub">Expected combined fantasy total · Hits + Runs + RBI</div>
+</div>
+<div class="preds">%%HRBI_CARDS%%</div>
+
+<div class="sec-rbi">
+  <div class="t-rbi">🎯 Top %%N_RBI%% — RBI</div>
+  <div class="sec-sub">Expected RBI tonight · Season rate · Pitcher quality adjustment</div>
+</div>
+<div class="preds">%%RBI_CARDS%%</div>
+
+<div class="footer">
+  <div class="mt">Methodology</div>
+  <div class="mg">
+    <div class="mi">🎯 <span>Barrel Rate (Statcast)</span></div>
+    <div class="mi">💥 <span>Exit Velocity</span></div>
+    <div class="mi">⚾ <span>Log5 HR Matchup</span></div>
+    <div class="mi">🏟️ <span>Park HR Factors</span></div>
+    <div class="mi">🌤️ <span>Live Weather + Wind</span></div>
+    <div class="mi">📊 <span>TB/PA + SLG rate</span></div>
+    <div class="mi">🤖 <span>XGBoost + Bayesian Blend</span></div>
+    <div class="mi">📐 <span>Poisson P(≥1 HR)</span></div>
+  </div>
+  <div class="fd"></div>
+  <div class="fn">Statcast © Baseball Savant · Weather © OpenWeatherMap<br>
+  <strong>For informational purposes only.</strong> Generated %%TS%% UTC.</div>
+</div></div></body></html>"""
+
+_CARD = """<div class="card"><div class="ct">
+  <div class="rk %%RC%%">%%RANK%%</div>
+  <div class="pi">
+    <div class="pn">%%NAME%%</div>
+    <div class="pm">%%TEAM%% · %%POS%% · Bats %%BATS%%</div>
+    <div class="mu">vs <strong>%%PITCHER%%</strong> (%%HAND%%HP) · %%VENUE%%</div>
+    <div class="bar-w"><div class="%%BAR_CLS%%" style="width:%%BAR%%%%"></div></div>
+    <div class="chips">%%CHIPS%%</div>
+  </div>
+  <div class="pb">
+    <div class="%%VAL_CLS%%">%%PRIMARY%%</div>
+    <div class="pl">%%LABEL%%</div>
+  </div>
+</div></div>"""
 
 
-# ---------------------------------------------------------------------------
-# Template helpers — plain str.replace(), no format() anywhere
-# ---------------------------------------------------------------------------
-
-def _sub(template: str, replacements: dict[str, str]) -> str:
-    """Replace %%KEY%% placeholders in template."""
-    result = template
-    for key, val in replacements.items():
-        result = result.replace(f"%%{key}%%", str(val))
-    return result
+def _sub(t: str, d: dict) -> str:
+    for k, v in d.items():
+        t = t.replace(f"%%{k}%%", str(v))
+    return t
 
 
-def _chip(css_class: str, icon: str, text: str) -> str:
-    return f'<span class="chip {css_class}">{icon} {text}</span>'
+def _chip(cls: str, icon: str, text: str) -> str:
+    return f'<span class="chip {cls}">{icon} {text}</span>'
 
 
-def _build_chips(pred: dict, weather: dict) -> str:
+def _shared_chips(pred: dict, section: str) -> str:
     chips = []
-    f   = pred.get("factors", {})
-    sc  = pred.get("statcast_metrics", {})
+    f    = pred.get("factors", {})
+    sc   = pred.get("statcast_metrics", {})
     tier = pred.get("confidence_tier", "Medium")
-
-    chips.append(_chip(f"chip-confidence-{tier}", "◉", f"{tier} confidence"))
+    cls  = {"High":"c-hi","Medium":"c-med","Low":"c-low"}.get(tier,"c-med")
+    chips.append(_chip(cls, "◉", tier))
 
     br = sc.get("barrel_rate")
-    if br is not None and br == br:   # nan check
-        chips.append(_chip("chip-barrel", "🎯", f"Barrel {float(br)*100:.1f}%"))
+    if br and br == br:
+        chips.append(_chip("c-a", "🎯", f"Barrel {float(br)*100:.1f}%"))
 
     ev = sc.get("avg_exit_velocity")
-    if ev is not None and ev == ev:
-        chips.append(_chip("chip-ev", "💥", f"EV {float(ev):.1f} mph"))
+    if ev and ev == ev:
+        chips.append(_chip("c-g", "💥", f"EV {float(ev):.1f}mph"))
 
     pf = float(f.get("park_factor", 1.0))
     if pf >= 1.05:
-        chips.append(_chip("chip-park", "🏟️", f"Park +{(pf-1)*100:.0f}%"))
+        chips.append(_chip("c-b", "🏟️", f"Park +{(pf-1)*100:.0f}%"))
     elif pf <= 0.95:
-        chips.append(_chip("chip-park", "🏟️", f"Park {(pf-1)*100:.0f}%"))
+        chips.append(_chip("c-r", "🏟️", f"Park {(pf-1)*100:.0f}%"))
 
-    wf       = float(f.get("weather_factor", 1.0))
-    wind_cat = weather.get("wind_category", "calm")
-    temp     = weather.get("temperature_f", 72)
-    wind_spd = weather.get("wind_speed_mph", 0)
+    wf = float(f.get("weather_factor", 1.0))
     if wf >= 1.06:
-        desc = f"Wind out {wind_spd:.0f}mph" if "out" in wind_cat else f"Warm {temp:.0f}°F"
-        chips.append(_chip("chip-wind", "💨", desc))
+        chips.append(_chip("c-g", "💨", "Wind out"))
     elif wf <= 0.94:
-        chips.append(_chip("chip-wind-bad", "🌬️", f"Wind in {wind_spd:.0f}mph"))
+        chips.append(_chip("c-r", "🌬️", "Wind in"))
 
-    plat = float(f.get("platoon_factor", 1.0))
-    if plat >= 1.05:
-        chips.append(_chip("chip-platoon", "↔️", "Platoon adv"))
-    elif plat <= 0.92:
-        chips.append(_chip("chip-platoon", "↔️", "Same hand"))
+    phf = float(f.get("pitcher_hit_factor", 1.0))
+    if section in ("tb", "hrbi", "rbi"):
+        if phf >= 1.10:
+            chips.append(_chip("c-g", "⚾", "Hit-prone P"))
+        elif phf <= 0.90:
+            chips.append(_chip("c-r", "⚾", "Stingy P"))
 
-    return "\n            ".join(chips)
+    if section == "tb":
+        chips.append(_chip("c-b", "📊", f"HR {pred.get('hr_pct','')}"))
+    elif section == "hrbi":
+        chips.append(_chip("c-g", "💥", f"HR {pred.get('hr_pct','')}"))
+        chips.append(_chip("c-b", "📊", f"TB {pred.get('expected_tb','')}"))
+    elif section == "rbi":
+        chips.append(_chip("c-b", "📊", f"TB {pred.get('expected_tb','')}"))
+
+    return "\n".join(chips)
+
+
+def _rank_cls(i: int, section: str) -> str:
+    sfx = {"hr":"hr","tb":"tb","hrbi":"hrbi","rbi":"rbi"}.get(section,"hr")
+    return {1:f"r1-{sfx}",2:f"r2-{sfx}",3:f"r3-{sfx}"}.get(i,"ro")
+
+
+def _build_section(predictions: list[dict], section: str) -> str:
+    bar_cls = {
+        "hr":"bar-hr","tb":"bar-tb","hrbi":"bar-hrbi","rbi":"bar-rbi"
+    }[section]
+    val_cls = {
+        "hr":"v-hr","tb":"v-tb","hrbi":"v-hrbi","rbi":"v-rbi"
+    }[section]
+    cards = []
+    for i, p in enumerate(predictions, 1):
+        if section == "hr":
+            primary = p.get("hr_pct", "0%")
+            label   = "HR Prob"
+            bar     = min(int(p.get("hr_probability", 0) * 100 * 2.5), 100)
+        elif section == "tb":
+            primary = f"{p.get('expected_tb','?')} TB"
+            label   = "Exp Total Bases"
+            bar     = min(int(float(p.get("expected_tb", 0)) / 4.0 * 100), 100)
+        elif section == "hrbi":
+            primary = f"{p.get('expected_hrbi','?')}"
+            label   = "Exp H+R+RBI"
+            bar     = min(int(float(p.get("expected_hrbi", 0)) / 4.0 * 100), 100)
+        else:  # rbi
+            primary = f"{p.get('expected_rbi','?')} RBI"
+            label   = "Exp RBI"
+            bar     = min(int(float(p.get("expected_rbi", 0)) / 2.0 * 100), 100)
+
+        pitcher = p.get("pitcher", {}) or {}
+        cards.append(_sub(_CARD, {
+            "RANK":    str(i), "RC": _rank_cls(i, section),
+            "NAME":    p.get("player_name","Unknown"),
+            "TEAM":    p.get("team",""),
+            "POS":     p.get("position",""),
+            "BATS":    p.get("bats","R"),
+            "PITCHER": pitcher.get("fullName","Unknown"),
+            "HAND":    pitcher.get("throws","R"),
+            "VENUE":   p.get("venue",""),
+            "BAR_CLS": bar_cls, "BAR": str(bar),
+            "CHIPS":   _shared_chips(p, section),
+            "VAL_CLS": val_cls,
+            "PRIMARY": primary, "LABEL": label,
+        }))
+    return "\n".join(cards)
 
 
 def build_html(
-    predictions: list[dict],
-    prediction_date: str,
-    games_today: int,
-    lineups_confirmed: int,
-    generated_at: str,
+    hr_preds: list[dict], tb_preds: list[dict],
+    hrbi_preds: list[dict], rbi_preds: list[dict],
+    date_str: str, games: int, lineups_confirmed: int, ts: str,
 ) -> str:
-    cards = []
-    for i, pred in enumerate(predictions, 1):
-        rank_class = str(i) if i <= 3 else "other"
-        prob       = pred["hr_probability"]
-        bar_pct    = min(int(prob * 100 * 2.5), 100)
-        weather    = pred.get("weather", {})
-        pitcher    = pred.get("pitcher", {}) or {}
+    total = len(set(
+        p.get("player_id") for p in hr_preds + tb_preds + hrbi_preds + rbi_preds
+        if p.get("player_id")
+    ))
+    avg_hr = sum(p.get("hr_probability",0) for p in hr_preds) / len(hr_preds) * 100 if hr_preds else 0
 
-        card = _sub(_CARD_TEMPLATE, {
-            "RANK":         str(i),
-            "RANK_CLASS":   rank_class,
-            "PLAYER_NAME":  pred.get("player_name", "Unknown"),
-            "TEAM":         pred.get("team", ""),
-            "POSITION":     pred.get("position", ""),
-            "BATS":         pred.get("bats", "R"),
-            "PITCHER_NAME": pitcher.get("fullName", "Unknown"),
-            "PITCHER_HAND": pitcher.get("throws", "R"),
-            "VENUE":        pred.get("venue", ""),
-            "BAR_PCT":      str(bar_pct),
-            "CHIPS":        _build_chips(pred, weather),
-            "HR_PCT":       pred.get("hr_pct", "0.0%"),
-        })
-        cards.append(card)
-
-    avg_prob = (
-        sum(p["hr_probability"] for p in predictions) / len(predictions) * 100
-        if predictions else 0
-    )
-
-    return _sub(_HTML_TEMPLATE, {
-        "PREDICTION_DATE":   prediction_date,
-        "TOP_N":             str(len(predictions)),
-        "GAMES_TODAY":       str(games_today),
-        "AVG_PROB":          f"{avg_prob:.1f}",
-        "LINEUPS_CONFIRMED": str(lineups_confirmed),
-        "PLAYER_CARDS":      "\n".join(cards),
-        "GENERATED_AT":      generated_at,
+    return _sub(_HTML, {
+        "DATE":      date_str, "GAMES": str(games),
+        "PLAYERS":   str(total), "AVGHR": f"{avg_hr:.1f}",
+        "LINEUPS":   str(lineups_confirmed),
+        "N_HR":      str(len(hr_preds)),
+        "N_TB":      str(len(tb_preds)),
+        "N_HRBI":    str(len(hrbi_preds)),
+        "N_RBI":     str(len(rbi_preds)),
+        "HR_CARDS":  _build_section(hr_preds,   "hr"),
+        "TB_CARDS":  _build_section(tb_preds,   "tb"),
+        "HRBI_CARDS":_build_section(hrbi_preds, "hrbi"),
+        "RBI_CARDS": _build_section(rbi_preds,  "rbi"),
+        "TS":        ts,
     })
 
 
-# ---------------------------------------------------------------------------
-# Send
-# ---------------------------------------------------------------------------
-
 def send_email(
-    predictions: list[dict],
-    prediction_date: str,
-    games_today: int,
-    lineups_confirmed: int,
-    generated_at: str,
-    subject_template: str = "⚾ Top {n} HR Predictions — {date}",
+    hr_preds: list[dict], tb_preds: list[dict],
+    hrbi_preds: list[dict], rbi_preds: list[dict],
+    date_str: str, games: int, lineups_confirmed: int, ts: str,
+    subject_template: str = "⚾ MLB Predictions — {date}",
 ) -> bool:
-    sender       = os.environ.get("EMAIL_SENDER", "")
-    password     = os.environ.get("EMAIL_PASSWORD", "")
-    recipients_r = os.environ.get("EMAIL_RECIPIENTS", "")
-    host         = os.environ.get("EMAIL_HOST", "smtp.gmail.com")
-    port         = int(os.environ.get("EMAIL_PORT", "587"))
+    sender  = os.environ.get("EMAIL_SENDER","")
+    pw      = os.environ.get("EMAIL_PASSWORD","")
+    recip_r = os.environ.get("EMAIL_RECIPIENTS","")
+    host    = os.environ.get("EMAIL_HOST","smtp.gmail.com")
+    port    = int(os.environ.get("EMAIL_PORT","587"))
 
-    if not sender or not password or not recipients_r:
+    if not sender or not pw or not recip_r:
         log.error("EMAIL_SENDER, EMAIL_PASSWORD, or EMAIL_RECIPIENTS not set.")
         return False
 
-    recipients = [r.strip() for r in recipients_r.split(",") if r.strip()]
-    subject    = subject_template.format(n=len(predictions), date=prediction_date)
+    recipients = [r.strip() for r in recip_r.split(",") if r.strip()]
+    total      = len(set(p.get("player_id") for p in hr_preds+tb_preds+hrbi_preds+rbi_preds))
+    subject    = subject_template.format(n=total, date=date_str)
+    html_body  = build_html(hr_preds, tb_preds, hrbi_preds, rbi_preds,
+                            date_str, games, lineups_confirmed, ts)
 
-    html_body = build_html(
-        predictions, prediction_date, games_today, lineups_confirmed, generated_at
-    )
-
-    # Plain-text fallback
-    lines = [f"MLB Home Run Predictions — {prediction_date}", "=" * 50]
-    for i, p in enumerate(predictions, 1):
-        pitcher = p.get("pitcher", {}) or {}
-        lines.append(
-            f"{i:2}. {p['player_name']:25s} {p['hr_pct']:>6}  "
-            f"vs {pitcher.get('fullName', '?')}"
-        )
-    text_body = "\n".join(lines)
+    lines = [f"MLB Predictions — {date_str}", "="*55,
+             f"\n💥 TOP HR"]
+    for i,p in enumerate(hr_preds,1):
+        pitcher = p.get("pitcher",{}) or {}
+        lines.append(f"  {i:2}. {p['player_name']:25s} {p['hr_pct']:>6}  vs {pitcher.get('fullName','?')}")
+    lines.append(f"\n📊 TOP TOTAL BASES")
+    for i,p in enumerate(tb_preds,1):
+        lines.append(f"  {i:2}. {p['player_name']:25s} {p.get('expected_tb','?')} exp TB")
+    lines.append(f"\n⭐ TOP H+R+RBI")
+    for i,p in enumerate(hrbi_preds,1):
+        lines.append(f"  {i:2}. {p['player_name']:25s} {p.get('expected_hrbi','?')} exp")
+    lines.append(f"\n🎯 TOP RBI")
+    for i,p in enumerate(rbi_preds,1):
+        lines.append(f"  {i:2}. {p['player_name']:25s} {p.get('expected_rbi','?')} exp RBI")
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"]    = f"MLB HR Predictor <{sender}>"
+    msg["From"]    = f"MLB Predictor <{sender}>"
     msg["To"]      = ", ".join(recipients)
-    msg.attach(MIMEText(text_body, "plain"))
+    msg.attach(MIMEText("\n".join(lines), "plain"))
     msg.attach(MIMEText(html_body, "html"))
 
     try:
-        with smtplib.SMTP(host, port) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(sender, password)
-            server.sendmail(sender, recipients, msg.as_string())
-        log.info("Email sent to %d recipient(s): %s", len(recipients), subject)
+        with smtplib.SMTP(host, port) as s:
+            s.ehlo(); s.starttls(); s.login(sender, pw)
+            s.sendmail(sender, recipients, msg.as_string())
+        log.info("Email sent (%d HR, %d TB, %d H+R+RBI, %d RBI predictions).",
+                 len(hr_preds), len(tb_preds), len(hrbi_preds), len(rbi_preds))
         return True
     except Exception as exc:
         log.error("Failed to send email: %s", exc)

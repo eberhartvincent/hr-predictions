@@ -1,42 +1,49 @@
 # ============================================================
 #  MLB Home Run Predictor — Configuration
 # ============================================================
-# All values here are defaults. Override via env vars or
-# GitHub Actions workflow inputs.
 
 prediction:
-  top_n: 35                  # How many players to show in the email
-  date: "today"              # "today" or "YYYY-MM-DD"
-  min_pa_season: 30          # Min plate appearances (season) to qualify
-  min_pa_career: 100         # Min plate appearances (career) to qualify
-  min_games_played: 10       # Min games played this season to qualify
+  date: "today"
+  top_n_hr:    10    # Home runs
+  top_n_tb:    10    # Total bases
+  top_n_hrbi:  10    # H + R + RBI combined
+  top_n_rbi:   10    # RBI only
+  # legacy top_n still works — overrides all four if set
+  top_n: 10
+  min_pa_season: 30
+  min_games_played: 10
 
 model:
-  # Relative weights used in the ensemble scoring
-  # Must sum to 1.0
   weights:
-    barrel_rate:      0.25   # Statcast barrel % (best HR predictor)
-    exit_velocity:    0.15   # Average exit velocity on contact
-    hr_rate:          0.20   # Batter's HR/PA rate (blended season+career)
-    pitcher_factor:   0.18   # Pitcher's HR allowed profile
-    park_factor:      0.10   # Ballpark HR factor
-    weather_factor:   0.07   # Temp, wind speed/direction
-    platoon_factor:   0.03   # Handedness matchup advantage
-    recent_form:      0.02   # Performance over last N games
+    barrel_rate:      0.25
+    exit_velocity:    0.15
+    hr_rate:          0.20
+    pitcher_factor:   0.18
+    park_factor:      0.10
+    weather_factor:   0.07
+    platoon_factor:   0.03
+    recent_form:      0.02
 
-  recent_form_games: 15      # Window for recent form calculation
-  career_season_blend: 0.35  # Weight on career stats (1-x = season weight)
-  min_ip_pitcher: 10         # Min innings pitched for pitcher to qualify
+  recent_form_games: 15
+  career_season_blend: 0.35
+  min_ip_pitcher: 10
+
+  # League averages (2022-25 MLB)
+  lg_hr_per_pa:   0.033
+  lg_tb_per_pa:   0.358    # SLG ~.411 × AB/PA ~.872
+  lg_h_per_pa:    0.216    # AVG ~.248 × AB/PA ~.872
+  lg_r_per_game:  0.490    # ~4.4 R/team/game ÷ 9 players
+  lg_rbi_per_game: 0.490
+  lg_era:         4.20
+  lg_pa_per_game: 4.1
 
 email:
-  subject: "⚾ Top {n} HR Predictions — {date}"
-  from_name: "MLB HR Predictor"
-  # Recipients come from EMAIL_RECIPIENTS secret (comma-separated)
+  subject: "⚾ MLB Predictions — {date}"
+  from_name: "MLB Predictor"
 
 weather:
-  # Stadiums with retractable/permanent roofs — weather ignored
   covered_stadiums:
-    - "Daikin Park"
+    - "Minute Maid Park"
     - "Globe Life Field"
     - "American Family Field"
     - "Chase Field"
@@ -44,21 +51,14 @@ weather:
     - "Rogers Centre"
     - "T-Mobile Park"
     - "loanDepot park"
-    - "Toyota Dome"
-
-  # Temperature effect: ball travels ~1% farther per 10°F above 70°F
+    - "Daikin Park"
   temp_baseline_f: 70
-  temp_effect_per_10f: 0.012   # 1.2% HR rate boost per 10°F above baseline
-
-  # Wind thresholds
-  wind_out_boost: 0.10         # 10% boost when wind blows out ≥ 10 mph
-  wind_in_penalty: -0.10       # 10% penalty when wind blows in ≥ 10 mph
+  temp_effect_per_10f: 0.012
+  wind_out_boost: 0.10
+  wind_in_penalty: -0.10
   wind_threshold_mph: 10
 
 parks:
-  # HR park factors — 1.00 = neutral, >1 = HR friendly
-  # Keys must match EXACT MLB Stats API venue names (same as weather_client.py).
-  # Derived from 3-year rolling park factors (update annually).
   factors:
     "Coors Field":                    1.38
     "Great American Ball Park":       1.18
@@ -66,7 +66,7 @@ parks:
     "Yankee Stadium":                 1.13
     "Fenway Park":                    1.11
     "Globe Life Field":               1.09
-    "Oriole Park at Camden Yards":    1.07   # was "Camden Yards"
+    "Oriole Park at Camden Yards":    1.07
     "Guaranteed Rate Field":          1.06
     "Comerica Park":                  1.02
     "Wrigley Field":                  1.01
@@ -78,7 +78,7 @@ parks:
     "Dodger Stadium":                 0.97
     "PNC Park":                       0.97
     "Kauffman Stadium":               0.96
-    "Angel Stadium of Anaheim":       0.95  # was "Angel Stadium"
+    "Angel Stadium of Anaheim":       0.95
     "Citi Field":                     0.94
     "Tropicana Field":                0.93
     "T-Mobile Park":                  0.92
@@ -87,7 +87,7 @@ parks:
     "Oracle Park":                    0.88
     "Rogers Centre":                  0.96
     "Chase Field":                    1.02
-    "Minute Maid Park":               1.00
+    "Daikin Park":                    1.00
     "loanDepot park":                 0.94
     "Sutter Health Park":             1.00
     "default":                        1.00
