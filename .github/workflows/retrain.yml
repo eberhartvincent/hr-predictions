@@ -1,41 +1,33 @@
 # .github/workflows/retrain.yml
 # =====================================================================
-#  MLB HR Predictor — Weekly Model Retraining
-# =====================================================================
+#  MLB Batter Predictor — Annual Model Retraining (5 models)
 #
-#  Runs every Monday at 6 AM ET (10:00 UTC) — off-season safe,
-#  the job exits cleanly if no FanGraphs data is available yet.
+#  Trains XGBoost models for:
+#    hr  → HR/PA rate
+#    tb  → Total Bases/PA rate
+#    h   → Hits/PA rate
+#    r   → Runs/game rate
+#    rbi → RBI/game rate
 #
-#  What it does:
-#    1. Pulls 3 seasons of FanGraphs batting stats via pybaseball
-#       (includes Statcast metrics: Barrel%, EV, HardHit%, FB%, etc.)
-#    2. Builds year-N → year-(N+1) training pairs (no look-ahead bias)
-#    3. Trains XGBoost regressor to predict HR/PA talent rate
-#    4. Evaluates via 5-fold cross-validation and logs MAE + R²
-#    5. Commits models/hr_model.json + models/feature_metadata.json
-#       back to the repo so the daily job picks them up automatically
-#
-#  Manual trigger: Actions → Retrain HR Model → Run workflow
-#
-#  No extra secrets required — uses GITHUB_TOKEN for the commit.
-#
+#  All use year-N Statcast features → year-(N+1) target rates.
+#  Runs November 1st each year after the season ends.
 # =====================================================================
 
-name: 🔁 Retrain HR Model
+name: 🔁 Retrain MLB Models
 
 on:
   schedule:
-    - cron: "0 10 * * 1"   # Every Monday 6 AM ET
+    - cron: "0 10 1 11 *"   # November 1st each year
 
   workflow_dispatch:
     inputs:
       years:
-        description: "Training years (comma-separated, e.g. 2022,2023,2024,2025,2026)"
+        description: "Training years (comma-separated)"
         required: false
         default: "2022,2023,2024,2025,2026"
         type: string
       dry_run:
-        description: "Train but don't commit model to repo"
+        description: "Train but don't commit"
         required: false
         default: "false"
         type: choice
@@ -43,15 +35,15 @@ on:
 
 jobs:
   retrain:
-    name: Train XGBoost HR Model
+    name: Train XGBoost MLB Models (HR · TB · H · R · RBI)
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
     permissions:
-      contents: write   # needed to commit model files back to repo
+      contents: write
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -60,15 +52,12 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install dependencies
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Cache pybaseball downloads — FanGraphs season stats are stable
-      # and don't change for past seasons, so a weekly cache is safe.
       - name: Cache pybaseball data
         uses: actions/cache@v4
         with:
@@ -77,23 +66,23 @@ jobs:
           restore-keys: |
             pybaseball-retrain-${{ runner.os }}-
 
-      - name: Train model
+      - name: Train all five models
         run: |
           YEARS="${{ github.event.inputs.years || '2022,2023,2024,2025,2026' }}"
           python - << EOF
           import logging, sys
-          logging.basicConfig(
-              level=logging.INFO,
+          logging.basicConfig(level=logging.INFO,
               format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
-              datefmt="%H:%M:%S",
-          )
+              datefmt="%H:%M:%S")
           from src.models.train import train
           years = [int(y.strip()) for y in "${YEARS}".split(",")]
           try:
-              meta = train(years=years)
-              print(f"::notice::Training complete — CV R²={meta['cv_r2']:.4f}, MAE={meta['cv_mae']:.5f}, n={meta['n_training']}")
+              all_meta = train(years=years)
+              for name, meta in all_meta.items():
+                  print(f"::notice::{name}: R²={meta['cv_r2']:.4f}  MAE={meta['cv_mae']:.5f}  n={meta['n_training']}")
           except Exception as e:
               print(f"::error::Training failed: {e}")
+              import traceback; traceback.print_exc()
               sys.exit(1)
           EOF
 
@@ -102,53 +91,89 @@ jobs:
           python - << 'EOF'
           import json
           from pathlib import Path
-          meta = json.loads(Path("models/feature_metadata.json").read_text())
-          print("=" * 50)
-          print("MODEL SUMMARY")
-          print("=" * 50)
-          print(f"Training years : {meta['training_years']}")
-          print(f"Training examples: {meta['n_training']}")
-          print(f"Features       : {meta['features']}")
-          print(f"CV R²          : {meta['cv_r2']:.4f}")
-          print(f"CV MAE         : {meta['cv_mae']:.5f} HR/PA")
-          print(f"LG avg HR/PA   : {meta['lg_hr_pa']:.4f}")
-          print("\nFeature Importance:")
-          for feat, imp in meta['feature_importance'].items():
-              bar = "█" * int(imp * 100)
-              print(f"  {feat:20s} {imp:.4f}  {bar}")
+
+          print("=" * 65)
+          print("MLB MODEL SUMMARY")
+          print("=" * 65)
+
+          models = {
+              "hr":  ("HR/PA rate",    "hr_model.json",  "feature_metadata.json"),
+              "tb":  ("TB/PA rate",    "tb_model.json",  "tb_metadata.json"),
+              "h":   ("H/PA rate",     "h_model.json",   "h_metadata.json"),
+              "r":   ("R/game rate",   "r_model.json",   "r_metadata.json"),
+              "rbi": ("RBI/game rate", "rbi_model.json", "rbi_metadata.json"),
+          }
+
+          for name, (label, model_file, meta_file) in models.items():
+              path = Path(f"models/{meta_file}")
+              if not path.exists():
+                  print(f"\n{name.upper()} ({label}): not found")
+                  continue
+              meta = json.loads(path.read_text())
+              print(f"\n{name.upper()} — {label}")
+              print(f"  Samples   : {meta.get('n_training', '?')}")
+              print(f"  CV R²     : {meta.get('cv_r2', 0):.4f}")
+              print(f"  CV MAE    : {meta.get('cv_mae', 0):.5f}")
+              print(f"  LG avg    : {meta.get('lg_avg', 0):.4f}")
+              print(f"  Features  : {meta.get('features', [])}")
+              print(f"  Top feat  : {list(meta.get('feature_importance', {}).keys())[:3]}")
+
+          print("=" * 65)
           EOF
 
-      - name: Commit model to repository
+      - name: Commit models to repository
         if: ${{ github.event.inputs.dry_run != 'true' }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add models/hr_model.json models/feature_metadata.json
+          # Add all model files (new naming + legacy hr model)
+          git add \
+            models/hr_model.json   models/feature_metadata.json \
+            models/tb_model.json   models/tb_metadata.json \
+            models/h_model.json    models/h_metadata.json \
+            models/r_model.json    models/r_metadata.json \
+            models/rbi_model.json  models/rbi_metadata.json \
+            2>/dev/null || true
 
-          # Only commit if something actually changed
           if git diff --staged --quiet; then
-            echo "Model unchanged — nothing to commit."
+            echo "Models unchanged — nothing to commit."
           else
-            METRICS=$(python -c "
+            SUMMARY=$(python - << 'EOF'
           import json
           from pathlib import Path
-          m = json.loads(Path('models/feature_metadata.json').read_text())
-          print(f\"R²={m['cv_r2']:.4f} MAE={m['cv_mae']:.5f} n={m['n_training']}\")
-          ")
-            git commit -m "chore: retrain HR model [${METRICS}]
+          parts = []
+          for name, meta_file in [("hr","feature_metadata.json"),("tb","tb_metadata.json"),
+                                   ("h","h_metadata.json"),("r","r_metadata.json"),("rbi","rbi_metadata.json")]:
+              p = Path(f"models/{meta_file}")
+              if p.exists():
+                  m = json.loads(p.read_text())
+                  parts.append(f"{name} R²={m.get('cv_r2',0):.4f}")
+          print(" | ".join(parts))
+          EOF
+          )
+            git commit -m "chore: retrain MLB models [${SUMMARY}]
 
           Training years: ${{ github.event.inputs.years || '2022,2023,2024,2025,2026' }}
           Run: ${{ github.run_id }}"
             git push
-            echo "✅ Model committed and pushed."
+            echo "✅ All MLB models committed."
           fi
 
-      - name: Upload model artifact (backup)
+      - name: Upload artifact backup
         uses: actions/upload-artifact@v4
         with:
-          name: hr-model-${{ github.run_id }}
+          name: mlb-models-${{ github.run_id }}
           path: |
             models/hr_model.json
             models/feature_metadata.json
+            models/tb_model.json
+            models/tb_metadata.json
+            models/h_model.json
+            models/h_metadata.json
+            models/r_model.json
+            models/r_metadata.json
+            models/rbi_model.json
+            models/rbi_metadata.json
+          if-no-files-found: ignore
           retention-days: 90

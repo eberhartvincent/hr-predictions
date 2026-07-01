@@ -288,14 +288,16 @@ def run(config: dict, dry_run: bool = False) -> list[dict]:
     model_cfg = config.get("model", {})
 
     # ── Model ─────────────────────────────────────────────────────────────
-    xgb_model, xgb_meta = fn["load_model"]()
-    if xgb_model is not None:
-        log.info(
-            "✅ XGBoost model loaded (R²=%.4f, n=%d)",
-            xgb_meta.get("cv_r2", 0), xgb_meta.get("n_training", 0),
-        )
+    xgb_models, xgb_metas = fn["load_model"]()
+    loaded = [n for n, m in xgb_models.items() if m is not None]
+    if loaded:
+        log.info("✅ XGBoost models loaded: %s", loaded)
+        for name in loaded:
+            log.info("   %s — R²=%.4f, n=%d",
+                     name, xgb_metas[name].get("cv_r2", 0),
+                     xgb_metas[name].get("n_training", 0))
     else:
-        log.info("ℹ️  No trained model — using statistical model only.")
+        log.info("ℹ️  No trained models — using statistical models only.")
 
     # ── Date ──────────────────────────────────────────────────────────────
     game_date = resolve_game_date(pred_cfg.get("date", "today"), fn)
@@ -380,8 +382,8 @@ def run(config: dict, dry_run: bool = False) -> list[dict]:
                         venue=venue,
                         weather=weather,
                         config=config,
-                        xgb_model=xgb_model,
-                        xgb_meta=xgb_meta,
+                        xgb_models=xgb_models,
+                        xgb_metas=xgb_metas,
                     )
                     pred.update({
                         "player_id":        player_id,
