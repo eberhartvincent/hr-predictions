@@ -1,0 +1,45 @@
+{
+  "model_name": "tb",
+  "target": "tb_pa",
+  "features": [
+    "xslg",
+    "barrel_pct",
+    "exit_velocity",
+    "hard_hit_pct",
+    "launch_angle",
+    "sweet_spot_pct",
+    "iso",
+    "bb_pct"
+  ],
+  "feature_medians": {
+    "xslg": 0.444,
+    "barrel_pct": 9.3,
+    "exit_velocity": 89.9,
+    "hard_hit_pct": 43.0,
+    "launch_angle": 13.2,
+    "sweet_spot_pct": 34.5,
+    "iso": -0.262,
+    "bb_pct": 0.08856088560885608
+  },
+  "lg_avg": 0.392637416789898,
+  "training_years": [
+    2022,
+    2023,
+    2024,
+    2025,
+    2026
+  ],
+  "n_training": 349,
+  "cv_mae": 0.03866811567958424,
+  "cv_r2": 0.21243031227332876,
+  "feature_importance": {
+    "xslg": 0.3343278765678406,
+    "exit_velocity": 0.12992116808891296,
+    "barrel_pct": 0.12104184180498123,
+    "hard_hit_pct": 0.11579432338476181,
+    "launch_angle": 0.09548216313123703,
+    "bb_pct": 0.07423614710569382,
+    "iso": 0.06852814555168152,
+    "sweet_spot_pct": 0.06066834554076195
+  }
+}

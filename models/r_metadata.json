@@ -1,0 +1,39 @@
+{
+  "model_name": "r",
+  "target": "r_game",
+  "features": [
+    "xwoba",
+    "bb_pct",
+    "iso",
+    "hard_hit_pct",
+    "barrel_pct",
+    "k_pct"
+  ],
+  "feature_medians": {
+    "xwoba": 0.336,
+    "bb_pct": 0.08856088560885608,
+    "iso": -0.262,
+    "hard_hit_pct": 43.0,
+    "barrel_pct": 9.3,
+    "k_pct": 0.20347003154574134
+  },
+  "lg_avg": 0.5492084444741916,
+  "training_years": [
+    2022,
+    2023,
+    2024,
+    2025,
+    2026
+  ],
+  "n_training": 349,
+  "cv_mae": 0.08854200351844546,
+  "cv_r2": -0.0471895484860434,
+  "feature_importance": {
+    "xwoba": 0.22448067367076874,
+    "barrel_pct": 0.20340877771377563,
+    "hard_hit_pct": 0.177804633975029,
+    "bb_pct": 0.13885632157325745,
+    "k_pct": 0.1306380331516266,
+    "iso": 0.12481161952018738
+  }
+}

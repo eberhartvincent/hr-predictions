@@ -1,0 +1,42 @@
+{
+  "model_name": "h",
+  "target": "h_pa",
+  "features": [
+    "hard_hit_pct",
+    "sweet_spot_pct",
+    "exit_velocity",
+    "k_pct",
+    "bb_pct",
+    "xwoba",
+    "barrel_pct"
+  ],
+  "feature_medians": {
+    "hard_hit_pct": 43.0,
+    "sweet_spot_pct": 34.5,
+    "exit_velocity": 89.9,
+    "k_pct": 0.20347003154574134,
+    "bb_pct": 0.08856088560885608,
+    "xwoba": 0.336,
+    "barrel_pct": 9.3
+  },
+  "lg_avg": 0.23023602220382575,
+  "training_years": [
+    2022,
+    2023,
+    2024,
+    2025,
+    2026
+  ],
+  "n_training": 349,
+  "cv_mae": 0.01949143877858634,
+  "cv_r2": 0.11511030881672524,
+  "feature_importance": {
+    "bb_pct": 0.23026779294013977,
+    "k_pct": 0.22951006889343262,
+    "xwoba": 0.16030724346637726,
+    "exit_velocity": 0.10980036109685898,
+    "hard_hit_pct": 0.10510716587305069,
+    "sweet_spot_pct": 0.09265758097171783,
+    "barrel_pct": 0.07234980165958405
+  }
+}

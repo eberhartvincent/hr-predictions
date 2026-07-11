@@ -1,0 +1,42 @@
+{
+  "model_name": "rbi",
+  "target": "rbi_game",
+  "features": [
+    "barrel_pct",
+    "exit_velocity",
+    "hard_hit_pct",
+    "iso",
+    "xwoba",
+    "k_pct",
+    "sweet_spot_pct"
+  ],
+  "feature_medians": {
+    "barrel_pct": 9.3,
+    "exit_velocity": 89.9,
+    "hard_hit_pct": 43.0,
+    "iso": -0.262,
+    "xwoba": 0.336,
+    "k_pct": 0.20347003154574134,
+    "sweet_spot_pct": 34.5
+  },
+  "lg_avg": 0.5243548064517258,
+  "training_years": [
+    2022,
+    2023,
+    2024,
+    2025,
+    2026
+  ],
+  "n_training": 349,
+  "cv_mae": 0.08501366837553423,
+  "cv_r2": 0.21689110663737554,
+  "feature_importance": {
+    "exit_velocity": 0.26477867364883423,
+    "barrel_pct": 0.2545489966869354,
+    "xwoba": 0.11860167235136032,
+    "hard_hit_pct": 0.11338337510824203,
+    "k_pct": 0.09630950540304184,
+    "iso": 0.08881203085184097,
+    "sweet_spot_pct": 0.06356585025787354
+  }
+}
