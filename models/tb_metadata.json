@@ -12,34 +12,33 @@
     "bb_pct"
   ],
   "feature_medians": {
-    "xslg": 0.445,
-    "barrel_pct": 9.3,
-    "exit_velocity": 89.95,
-    "hard_hit_pct": 43.0,
-    "launch_angle": 13.2,
-    "sweet_spot_pct": 34.55,
-    "iso": -0.262,
-    "bb_pct": 0.08825655933214073
+    "xslg": 0.447,
+    "barrel_pct": 9.4,
+    "exit_velocity": 90.0,
+    "hard_hit_pct": 43.4,
+    "launch_angle": 13.3,
+    "sweet_spot_pct": 35.1,
+    "iso": -0.261,
+    "bb_pct": 0.09003215434083602
   },
-  "lg_avg": 0.3922759364586293,
+  "lg_avg": 0.3892390091757662,
   "training_years": [
-    2022,
     2023,
     2024,
     2025,
     2026
   ],
-  "n_training": 340,
-  "cv_mae": 0.03699188646587541,
-  "cv_r2": 0.1890154724862776,
+  "n_training": 255,
+  "cv_mae": 0.036073013091015,
+  "cv_r2": 0.18732881502396126,
   "feature_importance": {
-    "xslg": 0.2653413712978363,
-    "barrel_pct": 0.145793154835701,
-    "hard_hit_pct": 0.13642746210098267,
-    "exit_velocity": 0.12424542009830475,
-    "launch_angle": 0.09794287383556366,
-    "bb_pct": 0.08362717181444168,
-    "iso": 0.07791412621736526,
-    "sweet_spot_pct": 0.06870833784341812
+    "xslg": 0.25425606966018677,
+    "barrel_pct": 0.17186152935028076,
+    "iso": 0.11286286264657974,
+    "hard_hit_pct": 0.1079244539141655,
+    "exit_velocity": 0.09557230025529861,
+    "bb_pct": 0.08793697506189346,
+    "sweet_spot_pct": 0.08527562767267227,
+    "launch_angle": 0.08431021124124527
   }
 }
