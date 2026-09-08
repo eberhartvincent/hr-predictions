@@ -1,196 +1,149 @@
 """
 statcast_client.py
 ==================
-Pull Statcast (Baseball Savant) data via pybaseball.
-Computes barrel rate, exit velocity, launch angle, and related
-quality-of-contact metrics that are the strongest predictors of HR power.
+Fetches Statcast metrics from Baseball Savant leaderboard CSVs.
+Fetches the leaderboard ONCE per season per process (not per player).
+
+Threading safety
+----------------
+Multiple ThreadPoolExecutor workers call get_batter_statcast_metrics()
+simultaneously. Without a lock, all workers race to fetch the leaderboard
+before the cache is populated — causing 8+ concurrent Savant requests.
+The threading.Lock ensures exactly one fetch happens.
+
+Call preload_leaderboards(season) on the main thread before starting
+any parallel worker pools to avoid any race at all.
 """
 from __future__ import annotations
 
+import io
 import logging
-from datetime import date, timedelta
-from functools import lru_cache
+import threading
 
 import numpy as np
 import pandas as pd
+import requests
 
 log = logging.getLogger(__name__)
 
-# Barrel definition (per Statcast):
-# LA between 26–30° AND EV ≥ 98 mph, or higher LA paired with higher EV
-BARREL_LA_MIN = 26
-BARREL_LA_MAX = 30
-BARREL_EV_BASE = 98.0
+HEADERS = {"User-Agent": "hr-predictor/1.0 (github-actions; open-source)"}
+_session = requests.Session()
+_session.headers.update(HEADERS)
 
-# Hard-hit threshold
-HARD_HIT_EV = 95.0
+BARRELS_URL = (
+    "https://baseballsavant.mlb.com/leaderboard/statcast"
+    "?type=batter&year={year}&position=&team=&min=10&csv=true"
+)
+XSTATS_URL = (
+    "https://baseballsavant.mlb.com/leaderboard/expected_statistics"
+    "?type=batter&year={year}&position=&team=&min=10&csv=true"
+)
+
+_barrels_cache: dict[int, pd.DataFrame] = {}
+_xstats_cache:  dict[int, pd.DataFrame] = {}
+_lock = threading.Lock()    # prevents concurrent leaderboard fetches
 
 
-def _safe_import_pybaseball():
+def _f(val, default: float = np.nan) -> float:
     try:
-        import pybaseball as pb  # noqa: F401
-        return pb
-    except ImportError:
-        log.error("pybaseball not installed — Statcast features will be empty.")
-        return None
+        f = float(val)
+        return f if (f == f) else default
+    except (TypeError, ValueError):
+        return default
 
 
-@lru_cache(maxsize=32)
-def _fetch_statcast_batter(player_id: int, start: str, end: str) -> pd.DataFrame:
-    pb = _safe_import_pybaseball()
-    if pb is None:
-        return pd.DataFrame()
-    try:
-        pb.cache.enable()
-        df = pb.statcast_batter(start, end, player_id)
-        return df if df is not None and not df.empty else pd.DataFrame()
-    except Exception as exc:
-        log.warning("Statcast fetch failed for player %d: %s", player_id, exc)
-        return pd.DataFrame()
-
-
-def get_batter_statcast_metrics(
-    player_id: int,
-    season: int,
-    days_back: int = 365,
-) -> dict:
+def preload_leaderboards(season: int) -> None:
     """
-    Return quality-of-contact metrics for a batter over the season window.
-
-    Returns
-    -------
-    dict with keys:
-        barrel_rate, hard_hit_rate, avg_exit_velocity,
-        avg_launch_angle, hr_per_contact, fly_ball_rate,
-        n_batted_balls   (sample size)
+    Call this on the main thread BEFORE spawning worker pools.
+    Guarantees exactly one fetch per season — workers hit the cache only.
     """
-    end_dt = date.today()
-    start_dt = date(season, 3, 1)          # opening day earliest
-    if (end_dt - start_dt).days > days_back:
-        start_dt = end_dt - timedelta(days=days_back)
-
-    df = _fetch_statcast_batter(
-        player_id,
-        start_dt.strftime("%Y-%m-%d"),
-        end_dt.strftime("%Y-%m-%d"),
+    _load_leaderboards(season)
+    log.info(
+        "Savant leaderboards preloaded for %d — "
+        "barrels: %d players, xstats: %d players",
+        season,
+        len(_barrels_cache.get(season, pd.DataFrame())),
+        len(_xstats_cache.get(season, pd.DataFrame())),
     )
 
+
+def _load_leaderboards(season: int) -> None:
+    """Thread-safe leaderboard fetch. No-op if already cached."""
+    with _lock:
+        if season not in _barrels_cache:
+            try:
+                r = _session.get(BARRELS_URL.format(year=season), timeout=30)
+                r.raise_for_status()
+                df = pd.read_csv(io.StringIO(r.text))
+                df["player_id"] = pd.to_numeric(df["player_id"], errors="coerce")
+                _barrels_cache[season] = (
+                    df.dropna(subset=["player_id"]).set_index("player_id")
+                )
+                log.info("Savant barrels/%d: %d players", season, len(_barrels_cache[season]))
+            except Exception as exc:
+                log.warning("Savant barrels/%d failed: %s", season, exc)
+                _barrels_cache[season] = pd.DataFrame()
+
+        if season not in _xstats_cache:
+            try:
+                r = _session.get(XSTATS_URL.format(year=season), timeout=30)
+                r.raise_for_status()
+                df = pd.read_csv(io.StringIO(r.text))
+                df["player_id"] = pd.to_numeric(df["player_id"], errors="coerce")
+                _xstats_cache[season] = (
+                    df.dropna(subset=["player_id"]).set_index("player_id")
+                )
+                log.info("Savant xstats/%d: %d players", season, len(_xstats_cache[season]))
+            except Exception as exc:
+                log.warning("Savant xstats/%d failed: %s", season, exc)
+                _xstats_cache[season] = pd.DataFrame()
+
+
+def get_batter_statcast_metrics(player_id: int, season: int) -> dict:
+    """
+    Return Statcast metrics from the cached leaderboard.
+    O(1) lookup — no network call if preload_leaderboards() was called first.
+    """
+    _load_leaderboards(season)   # no-op if already cached
+
     empty = {
-        "barrel_rate": np.nan,
-        "hard_hit_rate": np.nan,
-        "avg_exit_velocity": np.nan,
-        "avg_launch_angle": np.nan,
-        "hr_per_contact": np.nan,
-        "fly_ball_rate": np.nan,
-        "n_batted_balls": 0,
+        "barrel_pct":       np.nan,
+        "barrel_pa":        np.nan,
+        "exit_velocity":    np.nan,
+        "launch_angle":     np.nan,
+        "sweet_spot_pct":   np.nan,
+        "hard_hit_pct":     np.nan,
+        "xwoba":            np.nan,
+        "xslg":             np.nan,
+        "n_batted_balls":   0,
     }
 
-    if df.empty:
-        return empty
+    result = empty.copy()
 
-    # Filter to batted balls only
-    batted = df[df["type"] == "X"].copy()
-    if len(batted) < 10:
-        return empty
+    brl_df = _barrels_cache.get(season, pd.DataFrame())
+    if not brl_df.empty and player_id in brl_df.index:
+        row = brl_df.loc[player_id]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[0]
+        result["barrel_pct"]     = _f(row.get("brl_percent"))
+        result["barrel_pa"]      = _f(row.get("brl_pa"))
+        result["exit_velocity"]  = _f(row.get("avg_hit_speed"))
+        result["launch_angle"]   = _f(row.get("avg_hit_angle"))
+        result["sweet_spot_pct"] = _f(row.get("anglesweetspotpercent"))
+        result["hard_hit_pct"]   = _f(row.get("ev95percent"))
+        result["n_batted_balls"] = int(_f(row.get("attempts"), 0))
 
-    ev = pd.to_numeric(batted["launch_speed"], errors="coerce")
-    la = pd.to_numeric(batted["launch_angle"], errors="coerce")
-    valid = batted[ev.notna() & la.notna()].copy()
-    valid["ev"] = ev[ev.notna() & la.notna()]
-    valid["la"] = la[ev.notna() & la.notna()]
+    xs_df = _xstats_cache.get(season, pd.DataFrame())
+    if not xs_df.empty and player_id in xs_df.index:
+        row = xs_df.loc[player_id]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[0]
+        result["xwoba"] = _f(row.get("est_woba"))
+        result["xslg"]  = _f(row.get("est_slg"))
 
-    if len(valid) < 10:
-        return empty
-
-    n = len(valid)
-
-    # Barrel: statcast definition (simplified)
-    def is_barrel(row):
-        e, l = row["ev"], row["la"]
-        if l < BARREL_LA_MIN or l > 50:
-            return False
-        if l <= BARREL_LA_MAX:
-            return e >= BARREL_EV_BASE
-        # Above 30°: EV threshold rises 2 mph per degree
-        required_ev = BARREL_EV_BASE + 2 * (l - BARREL_LA_MAX)
-        return e >= required_ev
-
-    valid["barrel"] = valid.apply(is_barrel, axis=1)
-    barrel_rate = valid["barrel"].mean()
-    hard_hit_rate = (valid["ev"] >= HARD_HIT_EV).mean()
-    avg_ev = valid["ev"].mean()
-    avg_la = valid["la"].mean()
-
-    # Fly ball rate (LA > 10°)
-    fly_ball_rate = (valid["la"] > 10).mean()
-
-    # HR per batted ball in Statcast window
-    hr_events = batted[batted["events"] == "home_run"]
-    hr_per_contact = len(hr_events) / n
-
-    return {
-        "barrel_rate": round(float(barrel_rate), 4),
-        "hard_hit_rate": round(float(hard_hit_rate), 4),
-        "avg_exit_velocity": round(float(avg_ev), 2),
-        "avg_launch_angle": round(float(avg_la), 2),
-        "hr_per_contact": round(float(hr_per_contact), 4),
-        "fly_ball_rate": round(float(fly_ball_rate), 4),
-        "n_batted_balls": n,
-    }
+    return result
 
 
 def get_pitcher_statcast_metrics(pitcher_id: int, season: int) -> dict:
-    """
-    Return HR-relevant pitching metrics from Statcast.
-    Higher barrel_rate_allowed / hard_hit_rate_allowed = more HR-prone.
-    """
-    pb = _safe_import_pybaseball()
-    empty = {
-        "barrel_rate_allowed": np.nan,
-        "hard_hit_rate_allowed": np.nan,
-        "avg_ev_allowed": np.nan,
-        "gb_rate": np.nan,
-        "fb_rate": np.nan,
-    }
-    if pb is None:
-        return empty
-
-    try:
-        pb.cache.enable()
-        end_dt = date.today().strftime("%Y-%m-%d")
-        start_dt = f"{season}-03-01"
-        df = pb.statcast_pitcher(start_dt, end_dt, pitcher_id)
-    except Exception as exc:
-        log.warning("Statcast pitcher fetch failed %d: %s", pitcher_id, exc)
-        return empty
-
-    if df is None or df.empty:
-        return empty
-
-    batted = df[df["type"] == "X"].copy()
-    if len(batted) < 10:
-        return empty
-
-    ev = pd.to_numeric(batted["launch_speed"], errors="coerce")
-    la = pd.to_numeric(batted["launch_angle"], errors="coerce")
-    valid = batted[ev.notna() & la.notna()].copy()
-    valid["ev"] = ev[ev.notna() & la.notna()]
-    valid["la"] = la[ev.notna() & la.notna()]
-
-    if len(valid) < 10:
-        return empty
-
-    barrel_allowed = (valid["ev"] >= BARREL_EV_BASE) & (
-        valid["la"].between(BARREL_LA_MIN, BARREL_LA_MAX)
-    )
-    hard_hit_allowed = valid["ev"] >= HARD_HIT_EV
-    gb_rate = (valid["la"] < 10).mean()
-    fb_rate = (valid["la"] > 25).mean()
-
-    return {
-        "barrel_rate_allowed": round(float(barrel_allowed.mean()), 4),
-        "hard_hit_rate_allowed": round(float(hard_hit_allowed.mean()), 4),
-        "avg_ev_allowed": round(float(valid["ev"].mean()), 2),
-        "gb_rate": round(float(gb_rate), 4),
-        "fb_rate": round(float(fb_rate), 4),
-    }
+    """Kept for backward compatibility — pitcher quality now handled via MLB API K%."""
+    return {}

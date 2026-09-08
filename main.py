@@ -35,20 +35,18 @@ logging.basicConfig(
 logging.getLogger("matplotlib").setLevel(logging.ERROR)
 log = logging.getLogger("main")
 
-# Parallel workers for API calls.
-# MLB API is permissive; pybaseball Statcast is slower so fewer workers.
-MLB_API_WORKERS  = 20
-STATCAST_WORKERS = 8
+# MLB API is I/O-bound and permissive — more workers = faster.
+# Statcast leaderboard is preloaded and cached — lookup is O(1), no pool needed.
+MLB_API_WORKERS = 30
 
 
 def _import_pipeline():
     from src.data.mlb_client import (
-        extract_matchups, get_batter_stats, get_pitcher_stats,
-        get_platoon_splits, get_player_info, get_recent_games,
-        get_roster, get_schedule,
+        extract_matchups, get_all_batter_data, get_players_info_batch,
+        get_pitcher_stats, get_roster, get_schedule,
     )
     from src.data.statcast_client import (
-        get_batter_statcast_metrics,
+        get_batter_statcast_metrics, preload_leaderboards,
     )
     from src.data.weather_client import get_game_weather
     from src.models.predictor import ensemble_predict
@@ -59,12 +57,11 @@ def _import_pipeline():
         "get_schedule":                get_schedule,
         "extract_matchups":            extract_matchups,
         "get_roster":                  get_roster,
-        "get_player_info":             get_player_info,
-        "get_batter_stats":            get_batter_stats,
         "get_pitcher_stats":           get_pitcher_stats,
-        "get_platoon_splits":          get_platoon_splits,
-        "get_recent_games":            get_recent_games,
+        "get_all_batter_data":         get_all_batter_data,
+        "get_players_info_batch":      get_players_info_batch,
         "get_batter_statcast_metrics": get_batter_statcast_metrics,
+        "preload_leaderboards":        preload_leaderboards,
         "get_game_weather":            get_game_weather,
         "ensemble_predict":            ensemble_predict,
         "send_email":                  send_email,
@@ -72,47 +69,15 @@ def _import_pipeline():
     }
 
 
-def load_config(path: str = "config.yml") -> dict:
-    with open(path) as f:
-        cfg = yaml.safe_load(f)
-    if os.environ.get("TOP_N"):
-        n = int(os.environ["TOP_N"])
-        for key in ("top_n", "top_n_hr", "top_n_tb", "top_n_hrbi", "top_n_rbi"):
-            cfg.setdefault("prediction", {})[key] = n
-    if os.environ.get("PREDICT_DATE"):
-        cfg.setdefault("prediction", {})["date"] = os.environ["PREDICT_DATE"]
-    return cfg
-
-
-# ---------------------------------------------------------------------------
-# Phase 1 helpers — parallel data fetching
-# ---------------------------------------------------------------------------
-
 def _fetch_batter_bundle(fn, player_id: int, season: int, recent_n: int) -> dict:
-    """Fetch all data needed for one batter in a single thread."""
-    info    = fn["get_player_info"](player_id)
-    stats   = fn["get_batter_stats"](player_id, season)
-    splits  = fn["get_platoon_splits"](player_id, season)
-    recent  = fn["get_recent_games"](player_id, season, recent_n)
-    return {
-        "info":   info,
-        "stats":  stats,
-        "splits": splits,
-        "recent": recent,
-    }
-
-
-def _fetch_statcast_bundle(fn, player_id: int, season: int) -> dict:
-    """Fetch Statcast metrics for one batter (slower — separate pool)."""
-    try:
-        return fn["get_batter_statcast_metrics"](player_id, season)
-    except Exception as exc:
-        log.debug("Statcast failed for player %d: %s", player_id, exc)
-        return {}
+    """
+    ONE API call per player (was four).
+    get_all_batter_data combines season + career + splits + game_log.
+    """
+    return fn["get_all_batter_data"](player_id, season, recent_n)
 
 
 def _fetch_pitcher_bundle(fn, pitcher_id: int, season: int) -> dict:
-    """Fetch pitcher stats."""
     try:
         return fn["get_pitcher_stats"](pitcher_id, season)
     except Exception as exc:
@@ -156,69 +121,77 @@ def prefetch_all(
         len(all_batter_ids), len(all_pitcher_ids), len(all_venues),
     )
 
-    # ── Weather (fast — one OWM call per venue) ───────────────────────────
+    # ── Preload Savant leaderboards on main thread (eliminates race) ──────
+    # All worker threads then get O(1) cache hits — no network calls.
+    fn["preload_leaderboards"](season)
+
+    # ── Weather ───────────────────────────────────────────────────────────
     weather_cache: dict[str, dict] = {}
     for venue in all_venues:
         weather_cache[venue] = fn["get_game_weather"](venue)
 
-    # ── Pitcher stats ─────────────────────────────────────────────────────
+    # ── Batch player info (1 call per 150 players, not 1 per player) ──────
+    batter_info_cache: dict[int, dict] = fn["get_players_info_batch"](list(all_batter_ids))
+    log.info("Player info batch fetched: %d players", len(batter_info_cache))
+
+    # ── Pitchers + batters in parallel (both use same MLB API pool) ───────
     pitcher_cache: dict[int, dict] = {}
+    batter_data_cache: dict[int, dict] = {}
+
     with ThreadPoolExecutor(max_workers=MLB_API_WORKERS) as pool:
-        futures = {
+        # Submit pitchers
+        pitcher_futures = {
             pool.submit(_fetch_pitcher_bundle, fn, pid, season): pid
             for pid in all_pitcher_ids
         }
-        for fut in as_completed(futures):
-            pid = futures[fut]
-            try:
-                pitcher_cache[pid] = fut.result()
-            except Exception as exc:
-                log.warning("Pitcher prefetch failed %d: %s", pid, exc)
-                pitcher_cache[pid] = {"season_stats": {}, "career_stats": {}}
-    log.info("Pitchers fetched: %d", len(pitcher_cache))
-
-    # ── Batter MLB API stats (info, season/career, splits, game log) ──────
-    batter_cache: dict[int, dict] = {}
-    with ThreadPoolExecutor(max_workers=MLB_API_WORKERS) as pool:
-        futures = {
+        # Submit batters at the same time (4→1 API call each)
+        batter_futures = {
             pool.submit(_fetch_batter_bundle, fn, pid, season, recent_n): pid
             for pid in all_batter_ids
         }
-        done = 0
-        for fut in as_completed(futures):
-            pid = futures[fut]
-            try:
-                batter_cache[pid] = fut.result()
-            except Exception as exc:
-                log.warning("Batter prefetch failed %d: %s", pid, exc)
-                batter_cache[pid] = {
-                    "info": {}, "stats": {"season_stats": {}, "career_stats": {}},
-                    "splits": {}, "recent": [],
-                }
-            done += 1
-            if done % 50 == 0:
-                log.info("  MLB API: %d/%d batters fetched …", done, len(all_batter_ids))
-    log.info("Batters fetched: %d", len(batter_cache))
+        all_futures = {**pitcher_futures, **batter_futures}
+        pitcher_set = set(pitcher_futures.values())
 
-    # ── Statcast (slower — separate pool with fewer workers) ─────────────
-    statcast_cache: dict[int, dict] = {}
-    with ThreadPoolExecutor(max_workers=STATCAST_WORKERS) as pool:
-        futures = {
-            pool.submit(_fetch_statcast_bundle, fn, pid, season): pid
-            for pid in all_batter_ids
-        }
         done = 0
-        for fut in as_completed(futures):
-            pid = futures[fut]
+        for fut in as_completed(all_futures):
+            pid = all_futures[fut]
             try:
-                statcast_cache[pid] = fut.result()
+                result = fut.result()
+                if pid in pitcher_set:
+                    pitcher_cache[pid] = result
+                else:
+                    batter_data_cache[pid] = result
             except Exception as exc:
-                log.debug("Statcast prefetch failed %d: %s", pid, exc)
-                statcast_cache[pid] = {}
+                if pid in pitcher_set:
+                    log.warning("Pitcher prefetch failed %d: %s", pid, exc)
+                    pitcher_cache[pid] = {"season_stats": {}, "career_stats": {}}
+                else:
+                    log.warning("Batter prefetch failed %d: %s", pid, exc)
+                    batter_data_cache[pid] = {
+                        "stats": {"season_stats": {}, "career_stats": {}},
+                        "splits": {}, "recent": [],
+                    }
             done += 1
             if done % 50 == 0:
-                log.info("  Statcast: %d/%d batters fetched …", done, len(all_batter_ids))
-    log.info("Statcast fetched: %d", len(statcast_cache))
+                log.info("  MLB API: %d/%d total requests …", done, len(all_futures))
+
+    log.info("Pitchers: %d | Batters: %d", len(pitcher_cache), len(batter_data_cache))
+
+    # ── Merge batter info + batter data into unified cache ────────────────
+    batter_cache: dict[int, dict] = {}
+    for pid in all_batter_ids:
+        info = batter_info_cache.get(pid, {})
+        data = batter_data_cache.get(pid, {
+            "stats": {"season_stats": {}, "career_stats": {}},
+            "splits": {}, "recent": [],
+        })
+        batter_cache[pid] = {"info": info, **data}
+
+    # ── Statcast — pure cache lookup, no network (leaderboard preloaded) ──
+    statcast_cache: dict[int, dict] = {}
+    for pid in all_batter_ids:
+        statcast_cache[pid] = fn["get_batter_statcast_metrics"](pid, season)
+    log.info("Statcast metrics: %d players (from cache)", len(statcast_cache))
 
     return batter_cache, statcast_cache, pitcher_cache, weather_cache
 
@@ -240,12 +213,7 @@ def _probable_lineup(fn, team_id: int, season: int, min_games: int) -> list[int]
         pid = entry.get("person", {}).get("id")
         if not pid:
             continue
-        try:
-            stats = fn["get_batter_stats"](pid, season)
-            if int(stats["season_stats"].get("gamesPlayed", 0)) >= min_games:
-                players.append(pid)
-        except Exception:
-            pass
+        players.append(pid)
     return players
 
 
@@ -344,6 +312,7 @@ def run(config: dict, dry_run: bool = False) -> list[dict]:
 
         for side in ("home", "away"):
             opp          = "away" if side == "home" else "home"
+            is_home      = side == "home"
             pitcher_info = matchup[f"{opp}_pitcher"]
             team_name    = matchup[f"{side}_team"]
 
@@ -382,6 +351,7 @@ def run(config: dict, dry_run: bool = False) -> list[dict]:
                         venue=venue,
                         weather=weather,
                         config=config,
+                        is_home=is_home,
                         xgb_models=xgb_models,
                         xgb_metas=xgb_metas,
                     )
@@ -394,6 +364,7 @@ def run(config: dict, dry_run: bool = False) -> list[dict]:
                         "pitcher":          pitcher_info,
                         "venue":            venue,
                         "weather":          weather,
+                        "is_home":          is_home,
                         "game_pk":          matchup["gamePk"],
                         "lineup_confirmed": matchup["lineup_confirmed"],
                     })
