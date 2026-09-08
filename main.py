@@ -69,6 +69,18 @@ def _import_pipeline():
     }
 
 
+def load_config(path: str = "config.yml") -> dict:
+    with open(path) as f:
+        cfg = yaml.safe_load(f)
+    if os.environ.get("TOP_N"):
+        n = int(os.environ["TOP_N"])
+        for key in ("top_n", "top_n_hr", "top_n_tb", "top_n_hrbi", "top_n_rbi"):
+            cfg.setdefault("prediction", {})[key] = n
+    if os.environ.get("PREDICT_DATE"):
+        cfg.setdefault("prediction", {})["date"] = os.environ["PREDICT_DATE"]
+    return cfg
+
+
 def _fetch_batter_bundle(fn, player_id: int, season: int, recent_n: int) -> dict:
     """
     ONE API call per player (was four).
